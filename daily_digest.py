@@ -1,3 +1,26 @@
+CACHE_FILE = "sent_doi_cache.txt"
+
+def load_cache():
+    try:
+        with open(CACHE_FILE, "r") as f:
+            return set(line.strip() for line in f)
+    except FileNotFoundError:
+        return set()
+
+def save_cache(ids):
+    with open(CACHE_FILE, "w") as f:
+        for doi in ids:
+            f.write(f"{doi}\n")
+
+# In main:
+sent = load_cache()
+all_items = [item for item in all_items if item.get("doi") not in sent]
+
+# After sending, add new DOIs to cache and save
+new_dois = [item["doi"] for item in selected if item.get("doi")]
+sent.update(new_dois)
+save_cache(sent)
+
 #!/usr/bin/env python3
 """
 Daily Digest – Gene Therapy / Editing / Delivery
@@ -494,15 +517,36 @@ def main():
         send_telegram("⚠️ No new relevant papers or posts found today.")
         return
 
-    # 6. Prepare for DeepSeek: we need to send all items (but limit to avoid token explosion)
-    # We'll take a sample of up to 80 items (abstracts may be long)
-    if len(all_items) > 80:
-        # Prioritise always‑include papers (those with 'always_include' flag)
-        always = [i for i in all_items if i.get("always_include")]
-        others = [i for i in all_items if not i.get("always_include")]
-        # shuffle others? not needed, just take top
-        selected = always + others[:80 - len(always)]
-        all_items = selected
+# 6. Filter to last 7 days only
+cutoff = datetime.now() - timedelta(days=7)
+all_items = [
+    item for item in all_items
+    if item.get("created_utc", datetime.now()) >= cutoff
+]
+
+# 7. Separate always-include authors
+always = [i for i in all_items if i.get("always_include")]
+others = [i for i in all_items if not i.get("always_include")]
+
+# 8. Pick exactly 5 from each source (PubMed, bioRxiv, Reddit)
+#    For Reddit, combine all subreddits and pick top 5 by score
+def pick_top(items, n=5):
+    return sorted(items, key=lambda x: x.get("score", 0), reverse=True)[:n]
+
+source_sampled = {
+    "PubMed": pick_top([i for i in others if i.get("source") == "PubMed"]),
+    "bioRxiv": pick_top([i for i in others if i.get("source") == "bioRxiv"]),
+    "Reddit": pick_top([i for i in others if i.get("source") == "Reddit"]),
+}
+
+# 9. Combine: always-include (unlimited, but typically 1-2/day) + top 5 from each source
+selected = always + source_sampled["PubMed"] + source_sampled["bioRxiv"] + source_sampled["Reddit"]
+
+# 10. If > 20, trim to top 20 by score (to avoid token issues)
+if len(selected) > 20:
+    selected = sorted(selected, key=lambda x: x.get("score", 0), reverse=True)[:20]
+
+# 11. Now send selected to DeepSeek
 
     # 7. Call DeepSeek
     logger.info("Sending items to DeepSeek for summarisation...")
