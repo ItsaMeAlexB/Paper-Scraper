@@ -1,0 +1,4 @@
+biopython
+requests
+praw
+python-dotenv
