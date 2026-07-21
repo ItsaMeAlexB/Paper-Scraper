@@ -235,7 +235,6 @@ CLINICALTRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
 def clinicaltrials_search(query, limit=50):
     """Search ClinicalTrials.gov by keyword, filtering by active/recruiting/completed statuses."""
-    # Build status filter
     status_filter = (
         "AREA[OverallStatus]ACTIVE OR "
         "AREA[OverallStatus]NOT_YET_RECRUITING OR "
@@ -243,9 +242,7 @@ def clinicaltrials_search(query, limit=50):
         "AREA[OverallStatus]ENROLLING_BY_INVITATION OR "
         "AREA[OverallStatus]COMPLETED"
     )
-    # Combine keyword query with status filter
     full_query = f"({query}) AND ({status_filter})"
-    
     params = {
         "query.term": full_query,
         "pageSize": min(limit, 100),
@@ -279,13 +276,12 @@ def parse_clinicaltrial(study):
     
     date_str = status_module.get("lastUpdatePostDate") or status_module.get("firstPostedDate") or ""
     
-    # Build summary from conditions and description
     summary = (conditions_module.get("briefSummary", "") or "")
     if not summary:
         summary = conditions_module.get("detailedDescription", "") or ""
     
     return {
-        "doi": None,  # ClinicalTrials.gov uses NCT ID as unique key
+        "doi": None,
         "nct_id": id_module.get("nctId"),
         "title": id_module.get("briefTitle") or id_module.get("officialTitle") or "",
         "abstract": summary[:CAPS["abstract"]],
@@ -296,7 +292,7 @@ def parse_clinicaltrial(study):
         "enrollment": design_module.get("enrollmentInfo", {}).get("count", ""),
         "date": date_str,
         "source": "ClinicalTrials.gov",
-        "pmid": None,  # PubPeer lookup by NCT ID
+        "pmid": None,
     }
 
 # ----------------------------------------------------------------------
@@ -399,8 +395,8 @@ You have candidates from different sources. Handle them as follows:
 
 1. **PubMed, bioRxiv, ClinicalTrials.gov**: You received the 3 oldest items per source. From each source, select the **1 most significant** item (so you'll output one from PubMed, one from bioRxiv, one from ClinicalTrials.gov). Prioritise those where gene editing, delivery, therapy, or engineering is the core focus. For clinical trials, include key details like study size, phase, status, and the intervention being tested.
 2. **Named authors**: These are always from David Liu or Ciaran Lee. Summarise each one directly – no selection needed.
-3. **Reddit (top subs)**: These are highly rated posts from r/labrats, r/bioinformatics, r/machinelearning, r/GeneEditing. Summarise each one directly – no relevance filtering needed.
-4. **Reddit (filtered subs)**: These are highly rated posts from r/clinicaltrials and r/biotech. **Evaluate each post** against your keywords (gene therapy, gene editing, gene delivery, genetic engineering, DNA repair, epigenetics, bioinformatics/biochem, machine learning/biochem). Include only those clearly relevant to these fields. Summarise the included ones.
+3. **Reddit (top subs)**: You will receive up to 3 posts per subreddit (r/labrats, r/bioinformatics, r/machinelearning, r/GeneEditing). From each subreddit, select **1 post** that provides the most **practically useful information** — e.g., lab tips, troubleshooting, protocol advice, tool recommendations, career insights. **Skip** rants, memes, news, or venting posts even if highly upvoted.
+4. **Reddit (filtered subs)**: You will receive up to 3 posts per subreddit (r/clinicaltrials, r/biotech). From each subreddit, select **1 post** that provides the most **practically useful and relevant information** to your keywords. Also skip rants, memes, or news. If none are relevant, output nothing for that subreddit.
 
 Output format (use these exact sections):
 
@@ -413,15 +409,15 @@ Output format (use these exact sections):
 1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
 **Clinical Trials (most significant):**
-1. [ClinicalTrials.gov] NCT123456: "title" – 2-3 sentence summary, including status, phase, enrollment size... (PubPeer: note)
+1. [ClinicalTrials.gov] NCT123456: "title" – summary including status, phase, enrollment... (PubPeer: note)
 
 **Named authors:**
 1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
-**Reddit (top subs):**
+**Reddit (top subs – practical advice):**
 1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
 
-**Reddit (filtered subs – relevant only):**
+**Reddit (filtered subs – relevant & practical):**
 1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
 
 Candidates:
@@ -544,7 +540,6 @@ def main():
                 if pub_date:
                     age_days = (now - pub_date).days
                     if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
-                        # Try PubPeer by NCT ID (some trials have PMIDs linked)
                         data["pubpeer_note"] = get_pubpeer_note(data["nct_id"])
                         data["source_type"] = "ClinicalTrials"
                         clinicaltrials_candidates.append(data)
@@ -603,27 +598,28 @@ def main():
     logger.info(f"Named authors: {len(author_selected)} oldest selected.")
 
     # ------------------------------------------------------------------
-    # 5. Reddit (top subs) – 1 highest-rated each
+    # 5. Reddit (top subs) – fetch top 3, DeepSeek selects 1 useful
     # ------------------------------------------------------------------
     top_reddit = []
     for sub in TOP_SUBREDDITS:
         posts = fetch_reddit_posts(sub)
         if posts:
-            best = sorted(posts, key=lambda x: x["score"], reverse=True)[0]
-            best["comments"] = fetch_comments(best["url"])
-            best["source"] = "Reddit (top)"
-            best["source_type"] = "Top Reddit"
-            top_reddit.append(best)
+            top_three = sorted(posts, key=lambda x: x["score"], reverse=True)[:3]
+            for post in top_three:
+                post["comments"] = fetch_comments(post["url"])
+                post["source"] = "Reddit (top)"
+                post["source_type"] = "Top Reddit"
+                top_reddit.append(post)
 
     # ------------------------------------------------------------------
-    # 6. Reddit (filtered subs) – 2 highest-rated each (no local keyword filter)
+    # 6. Reddit (filtered subs) – fetch top 3, DeepSeek selects 1 useful
     # ------------------------------------------------------------------
     filtered_reddit = []
     for sub in FILTERED_SUBREDDITS:
         posts = fetch_reddit_posts(sub)
         if posts:
-            top_two = sorted(posts, key=lambda x: x["score"], reverse=True)[:2]
-            for post in top_two:
+            top_three = sorted(posts, key=lambda x: x["score"], reverse=True)[:3]
+            for post in top_three:
                 post["comments"] = fetch_comments(post["url"])
                 post["source"] = "Reddit (filtered)"
                 post["source_type"] = "Filtered Reddit"
@@ -641,7 +637,6 @@ def main():
         filtered_reddit
     )
 
-    # Global dedupe (by DOI for papers, NCT for trials, URL/title for Reddit)
     seen = set()
     unique_candidates = []
     for item in all_candidates:
@@ -675,7 +670,6 @@ def main():
     # 10. Update cache
     # ------------------------------------------------------------------
     for item in all_candidates:
-        # Use DOI or NCT ID as cache key
         key = item.get("doi") or item.get("nct_id")
         if key:
             sent[key] = time.time()
