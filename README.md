@@ -11,8 +11,7 @@ It then:
 - Filters Reddit posts **1–8 days old** (to allow votes/comments to settle)
 - For **PubMed, bioRxiv, and ClinicalTrials.gov**: takes the **3 oldest** items per source and sends them to DeepSeek, which selects **1 most significant** from each.
 - For **named authors** (David Liu, Ciaran Lee): takes the **1 oldest** paper per author and summarises directly.
-- For **top Reddit subs** (`r/labrats`, `r/bioinformatics`, `r/machinelearning`, `r/GeneEditing`): takes **1 highest-rated** post per sub and summarises directly.
-- For **filtered Reddit subs** (`r/clinicaltrials`, `r/biotech`): takes **2 highest-rated** posts per sub and sends them to DeepSeek, which **evaluates relevance** and includes only those clearly matching your keywords.
+- For **Reddit**: fetches the **top 3 highest‑rated** posts from each subreddit (both top and filtered subs), then uses DeepSeek to select **1 post per subreddit** that provides the most **practically useful information** (lab tips, troubleshooting, protocol advice, tool recommendations, career insights) — skipping rants, memes, news, or venting even if highly upvoted. For filtered subs, DeepSeek also evaluates relevance to your keywords before selecting.
 - Checks PubPeer (notes comments, never cancels papers or trials).
 - Delivers a formatted daily digest via **Telegram** with separate sections for PubMed, bioRxiv, ClinicalTrials, named authors, and Reddit.
 
@@ -58,6 +57,11 @@ Reddit votes and comments stabilise within 24–48 hours. The 1–8 day window:
 - Skips very fresh posts where votes are still hidden
 - Catches posts with established discussion
 - Avoids stale content (>8 days)
+
+## Why Top 3 Then Select 1?
+
+For papers/trials: fetching 3 oldest gives DeepSeek enough options to pick the most significant while ensuring we see the earliest publications.
+For Reddit: fetching top 3 ensures practical tips aren't missed just because they're #2 or #3, while DeepSeek filters out rants/memes/news and selects the most useful post per subreddit.
 
 ## Setup
 
@@ -116,10 +120,10 @@ Push to GitHub. The workflow runs daily at **20:00 UTC** (avoids DeepSeek peak p
 **Named authors:**
 1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
-**Reddit (top subs):**
+**Reddit (top subs – practical advice):**
 1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
 
-**Reddit (filtered subs – relevant only):**
+**Reddit (filtered subs – relevant & practical):**
 1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
 ```
 
@@ -127,10 +131,12 @@ Push to GitHub. The workflow runs daily at **20:00 UTC** (avoids DeepSeek peak p
 
 - **No local relevance filtering for filtered Reddit**: DeepSeek evaluates relevance, avoiding false negatives from simplistic keyword matching.
 - **3 oldest papers/trials per source**: Gives DeepSeek enough options to pick the most significant, while ensuring we see the earliest (closest to 5 weeks) publications.
+- **Top 3 Reddit posts per sub**: Ensures practical tips aren't missed if they're #2 or #3; DeepSeek then selects the most useful and filters out rants/memes/news.
 - **PubPeer never cancels**: Comments are noted but papers/trials are never removed.
 - **Reddit not filtered by keywords for top subs**: Useful lab advice, career posts, and discussions are caught even if they don't match keywords.
 - **Character caps above normal**: Ensure no meaningful content is lost while preventing rants from clogging the system.
 - **Peak hours guardrail**: Skips runs during DeepSeek peak pricing, retries after 2 hours.
+- **Web search not enabled**: Adds unnecessary cost and latency; DeepSeek's reasoning on provided context is sufficient and more reliable.
 
 ## Troubleshooting
 
