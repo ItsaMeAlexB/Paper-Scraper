@@ -1,5 +1,4 @@
-# Paper-Scraper
-# Gene Therapy / Editing / Delivery / Engineering
+# Daily Digest – Gene Therapy / Editing / Delivery / Engineering
 
 Automated daily summary of relevant papers and Reddit discussions for gene therapy researchers.
 
@@ -65,12 +64,16 @@ Reddit votes and comments stabilise within 24–48 hours. The 1–8 day window:
 ### 1. GitHub Repository
 
 Create a new repository and push these files:
+
+```
 .
-├── .github/workflows/daily.yml
+├── .github
+│   └── workflows
+│       └── daily.yml
 ├── requirements.txt
 ├── daily_digest.py
 └── README.md
-
+```
 
 ### 2. Secrets
 
@@ -97,20 +100,19 @@ Push to GitHub. The workflow runs daily at **20:00 UTC** (avoids DeepSeek peak p
 - **GitHub Actions**: Free for public repositories
 
 ## Output Format
-🧬 Daily Digest – [Date]
 
-PubMed / bioRxiv:
+```
+🧬 **Daily Digest – [Date]**
 
-[source] "title" – 2-3 sentence summary... (PubPeer: note)
+**PubMed / bioRxiv:**
+1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
-Named authors:
+**Named authors:**
+1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
-[source] "title" – 2-3 sentence summary... (PubPeer: note)
-
-Reddit:
-
-[Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
-
+**Reddit:**
+1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
+```
 
 ## Design Rationale
 
