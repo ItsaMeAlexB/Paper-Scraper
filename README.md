@@ -1,7 +1,3 @@
-# Daily Digest – Gene Therapy / Editing / Delivery / Engineering
-
-Automated daily summary of relevant papers and Reddit discussions for gene therapy researchers.
-
 ## Overview
 
 This script scrapes:
