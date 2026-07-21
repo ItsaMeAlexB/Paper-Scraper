@@ -65,3 +65,67 @@ Reddit votes and comments stabilise within 24–48 hours. The 1–8 day window:
 ### 1. GitHub Repository
 
 Create a new repository and push these files:
+├── .github/workflows/daily.yml
+├── requirements.txt
+├── daily_digest.py
+└── README.mmd
+
+
+### 2. Secrets
+
+Go to your repo → **Settings** → **Secrets and variables** → **Actions** → add these:
+
+| Secret | Where to get it |
+| :--- | :--- |
+| `DEEPSEEK_API_KEY` | platform.deepseek.com → API Keys |
+| `TELEGRAM_BOT_TOKEN` | @BotFather on Telegram |
+| `TELEGRAM_CHAT_ID` | Send a message to your bot, then `https://api.telegram.org/bot<TOKEN>/getUpdates` |
+| `REDDIT_CLIENT_ID` | reddit.com/prefs/apps → create script app |
+| `REDDIT_CLIENT_SECRET` | same page |
+| `REDDIT_USER_AGENT` | e.g., `"DailyDigest/1.0 (by /u/username)"` |
+| `ENTREZ_EMAIL` | your email (NCBI requires it) |
+
+### 3. Run
+
+Push to GitHub. The workflow runs daily at **20:00 UTC** (avoids DeepSeek peak pricing). You can also trigger it manually from the Actions tab.
+
+## Cost
+
+- **DeepSeek API**: ~$0.0005 per day with `deepseek-v4-flash` model
+- **Free credit**: $5 for new users → enough for ~10,000 days
+- **GitHub Actions**: Free for public repositories
+
+## Output Format
+🧬 Daily Digest – [Date]
+
+PubMed / bioRxiv:
+
+[source] "title" – 2-3 sentence summary... (PubPeer: note)
+
+Named authors:
+
+[source] "title" – 2-3 sentence summary... (PubPeer: note)
+
+Reddit:
+
+[Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
+
+
+## Design Rationale
+
+- **No DeepSeek filtering**: Prevents false negatives where a paper is relevant but the AI misclassifies it.
+- **PubPeer never cancels**: Comments are noted but papers are never removed.
+- **Reddit not filtered by keywords for top subs**: Useful lab advice, career posts, and discussions are caught even if they don't match keywords.
+- **Character caps above normal**: Ensure no meaningful content is lost while preventing rants from clogging the system.
+- **Peak hours guardrail**: Skips runs during DeepSeek peak pricing, retries after 2 hours.
+
+## Troubleshooting
+
+- **Manual run**: Go to Actions tab → select workflow → "Run workflow".
+- **Check logs**: Actions tab shows stdout/stderr from each run.
+- **Telegram not sending**: Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are correct.
+- **DeepSeek failures**: Check your API key and balance at platform.deepseek.com.
+
+## License
+
+MIT – use freely, modify as needed.
