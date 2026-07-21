@@ -69,7 +69,7 @@ Create a new repository and push these files:
 ├── .github/workflows/daily.yml
 ├── requirements.txt
 ├── daily_digest.py
-└── README.mmd
+└── README.md
 
 
 ### 2. Secrets
