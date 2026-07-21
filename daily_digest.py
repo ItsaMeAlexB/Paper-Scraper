@@ -155,6 +155,16 @@ def run_if_not_peak(max_attempts=2, wait_seconds=7200):
 # HELPERS: PubMed
 # ----------------------------------------------------------------------
 
+def parse_pubmed_date(dp):
+    if not dp:
+        return None
+    for fmt in ("%Y %b %d", "%Y %b", "%Y"):
+        try:
+            return datetime.strptime(dp, fmt)
+        except ValueError:
+            continue
+    return None
+
 def pubmed_search(query, retmax=50):
     Entrez.email = ENTREZ_EMAIL
     handle = Entrez.esearch(db="pubmed", term=query, retmax=retmax)
@@ -253,7 +263,7 @@ def init_reddit():
         user_agent=REDDIT_USER_AGENT,
     )
 
-def fetch_reddit_posts(subreddit_name, keywords=None, limit=50):
+def fetch_reddit_posts(subreddit_name, limit=50):
     reddit = init_reddit()
     sub = reddit.subreddit(subreddit_name)
     posts = []
@@ -266,11 +276,6 @@ def fetch_reddit_posts(subreddit_name, keywords=None, limit=50):
             continue
         if post.num_comments < MIN_COMMENTS:
             continue
-        # Keyword filter for filtered subs
-        if keywords:
-            text = (post.title + " " + post.selftext).lower()
-            if not any(re.search(kw.lower(), text) for kw in keywords):
-                continue
         posts.append({
             "title": post.title,
             "url": post.url,
@@ -292,6 +297,7 @@ def fetch_comments(post_url):
         comment_text = c.body[:CAPS["comment"]]
         if len(c.body) > CAPS["comment"]:
             logger.info(f"Comment truncated for {post_url} (len={len(c.body)})")
+        c.replies.replace_more(limit=0)
         replies = sorted(c.replies, key=lambda r: r.score, reverse=True)[:1]
         reply_text = replies[0].body[:CAPS["reply"]] if replies else ""
         if replies and len(replies[0].body) > CAPS["reply"]:
@@ -317,32 +323,31 @@ def deepseek_summarize(candidates):
     prompt = f"""
 You are a scientific summariser for gene therapy researchers.
 
-You will receive a list of candidates from PubMed, bioRxiv, and Reddit.
-Your tasks:
+You have candidates from different sources. Handle them as follows:
 
-1. **Select the most significant item per category** (one per keyword for PubMed/bioRxiv, one per author, one per subreddit).
-2. **Prioritise** papers where gene editing, delivery, therapy, or engineering is the **core focus**.
-3. If no such paper exists for a keyword, still include the best available match.
-4. For each selected item, write **2–3 sentences** covering:
-   - What was done
-   - What was found
-   - How (method/approach)
+1. **PubMed & bioRxiv (search term results)**: You received the 3 oldest papers per source. From these, select the **1 most significant** paper overall (combining both sources). Prioritise papers where gene editing, delivery, therapy, or engineering is the core focus.
+2. **Named authors**: These are always from David Liu or Ciaran Lee. Summarise each one directly – no selection needed.
+3. **Reddit (top subs)**: These are highly rated posts from r/labrats, r/bioinformatics, r/machinelearning, r/GeneEditing. Summarise each one directly – no relevance filtering needed.
+4. **Reddit (filtered subs)**: These are highly rated posts from r/clinicaltrials and r/biotech. **Evaluate each post** against your keywords (gene therapy, gene editing, gene delivery, genetic engineering, DNA repair, epigenetics, bioinformatics/biochem, machine learning/biochem). Include only those clearly relevant to these fields. Summarise the included ones.
 
-Output format (sections):
+Output format (use these exact sections):
 
 🧬 **Daily Digest – [Date]**
 
-**PubMed / bioRxiv:**
-1. [source] "title" – summary... (PubPeer: note)
+**PubMed / bioRxiv (most significant):**
+1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
 **Named authors:**
-1. [source] "title" – summary... (PubPeer: note)
+1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
-**Reddit:**
-1. [Post] r/subreddit: "title" – summary... (Top comment: "quote" [+score])
+**Reddit (top subs):**
+1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
+
+**Reddit (filtered subs – relevant only):**
+1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
 
 Candidates:
-{chr(10).join([f"- {i.get('source')}: {i.get('title')} | {i.get('abstract', i.get('selftext', ''))[:CAPS['abstract']]} | PubPeer: {i.get('pubpeer_note', 'N/A')}" for i in candidates])}
+{chr(10).join([f"- {i.get('source_type')}: {i.get('title')} | Date: {i.get('date')} | {i.get('abstract', i.get('selftext', ''))[:CAPS['abstract']]} | PubPeer: {i.get('pubpeer_note', 'N/A')}" for i in candidates])}
 """
 
     payload = {
@@ -388,33 +393,42 @@ def main():
 
     logger.info("Starting daily digest...")
     sent = load_cache()
-    all_candidates = []
     now = datetime.now()
 
-    # 1. PubMed (search terms)
+    # ------------------------------------------------------------------
+    # 1. PubMed (search terms) – take 3 oldest
+    # ------------------------------------------------------------------
+    pubmed_candidates = []
     for kw in KEYWORDS:
-        logger.info(f"PubMed keyword: {kw}")
         pmids = pubmed_search(kw, retmax=50)
         if pmids:
             records = pubmed_fetch(pmids)
             for rec in records:
                 data = extract_pubmed_data(rec)
                 if data["doi"] and data["doi"] not in sent:
-                    # Check age window (4-5 weeks)
-                    try:
-                        pub_date = datetime.strptime(data["date"], "%Y %b %d")
-                    except:
-                        continue
-                    age_days = (now - pub_date).days
-                    if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
-                        data["pubpeer_note"] = get_pubpeer_note(data["doi"])
-                        data["source_type"] = "PubMed"
-                        all_candidates.append(data)
+                    pub_date = parse_pubmed_date(data["date"])
+                    if pub_date:
+                        age_days = (now - pub_date).days
+                        if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                            data["pubpeer_note"] = get_pubpeer_note(data["doi"])
+                            data["source_type"] = "PubMed_Search"
+                            pubmed_candidates.append(data)
 
-    # 2. bioRxiv (search terms)
+    seen = set()
+    unique_pubmed = []
+    for item in sorted(pubmed_candidates, key=lambda x: parse_pubmed_date(x["date"]) or now):
+        if item["doi"] not in seen:
+            seen.add(item["doi"])
+            unique_pubmed.append(item)
+    pubmed_selected = unique_pubmed[:3]
+    logger.info(f"PubMed: {len(pubmed_selected)} oldest candidates selected.")
+
+    # ------------------------------------------------------------------
+    # 2. bioRxiv (search terms) – take 3 oldest
+    # ------------------------------------------------------------------
+    biorxiv_candidates = []
     for kw in KEYWORDS:
         query = kw.replace('"', '').replace(' AND ', '+').replace(' ', '+')
-        logger.info(f"bioRxiv keyword: {query}")
         papers = biorxiv_search(query, limit=50)
         for p in papers:
             data = parse_biorxiv_paper(p)
@@ -426,30 +440,41 @@ def main():
                 age_days = (now - pub_date).days
                 if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
                     data["pubpeer_note"] = get_pubpeer_note(data["doi"])
-                    data["source_type"] = "bioRxiv"
-                    all_candidates.append(data)
+                    data["source_type"] = "bioRxiv_Search"
+                    biorxiv_candidates.append(data)
 
-    # 3. Named authors (separate, always include)
+    seen = set()
+    unique_biorxiv = []
+    for item in sorted(biorxiv_candidates, key=lambda x: x.get("date", "2000-01-01")):
+        if item["doi"] not in seen:
+            seen.add(item["doi"])
+            unique_biorxiv.append(item)
+    biorxiv_selected = unique_biorxiv[:3]
+    logger.info(f"bioRxiv: {len(biorxiv_selected)} oldest candidates selected.")
+
+    # ------------------------------------------------------------------
+    # 3. Named authors – take 1 oldest each
+    # ------------------------------------------------------------------
+    author_selected = []
     for author_rule in AUTHOR_RULES:
+        author_items = []
+        # PubMed
         for query in author_rule["pubmed_queries"]:
-            logger.info(f"PubMed author: {query}")
             pmids = pubmed_search(query, retmax=10)
             if pmids:
                 records = pubmed_fetch(pmids)
                 for rec in records:
                     data = extract_pubmed_data(rec)
                     if data["doi"] and data["doi"] not in sent:
-                        try:
-                            pub_date = datetime.strptime(data["date"], "%Y %b %d")
-                        except:
-                            continue
-                        age_days = (now - pub_date).days
-                        if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
-                            data["pubpeer_note"] = get_pubpeer_note(data["doi"])
-                            data["source_type"] = "Named author"
-                            data["author_label"] = author_rule["name"]
-                            all_candidates.append(data)
-        # bioRxiv author search
+                        pub_date = parse_pubmed_date(data["date"])
+                        if pub_date:
+                            age_days = (now - pub_date).days
+                            if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                                data["pubpeer_note"] = get_pubpeer_note(data["doi"])
+                                data["source_type"] = "Named author"
+                                data["author_label"] = author_rule["name"]
+                                author_items.append(data)
+        # bioRxiv
         query = author_rule["biorxiv_query"].replace('"', '').replace(' ', '+')
         papers = biorxiv_search(query, limit=10)
         for p in papers:
@@ -464,55 +489,85 @@ def main():
                     data["pubpeer_note"] = get_pubpeer_note(data["doi"])
                     data["source_type"] = "Named author"
                     data["author_label"] = author_rule["name"]
-                    all_candidates.append(data)
+                    author_items.append(data)
+        if author_items:
+            oldest = sorted(author_items, key=lambda x: parse_pubmed_date(x.get("date")) or now)[0]
+            author_selected.append(oldest)
 
-    # 4. Reddit (top subs)
+    logger.info(f"Named authors: {len(author_selected)} oldest selected.")
+
+    # ------------------------------------------------------------------
+    # 4. Reddit (top subs) – 1 highest-rated each
+    # ------------------------------------------------------------------
+    top_reddit = []
     for sub in TOP_SUBREDDITS:
-        posts = fetch_reddit_posts(sub, keywords=None)
+        posts = fetch_reddit_posts(sub)
         if posts:
             best = sorted(posts, key=lambda x: x["score"], reverse=True)[0]
             best["comments"] = fetch_comments(best["url"])
-            best["source"] = "Reddit"
-            best["source_type"] = "Reddit"
-            all_candidates.append(best)
+            best["source"] = "Reddit (top)"
+            best["source_type"] = "Top Reddit"
+            top_reddit.append(best)
 
-    # 5. Reddit (filtered subs)
+    # ------------------------------------------------------------------
+    # 5. Reddit (filtered subs) – 2 highest-rated each (no local keyword filter)
+    # ------------------------------------------------------------------
+    filtered_reddit = []
     for sub in FILTERED_SUBREDDITS:
-        posts = fetch_reddit_posts(sub, keywords=KEYWORDS)
+        posts = fetch_reddit_posts(sub)
         if posts:
-            best = sorted(posts, key=lambda x: x["score"], reverse=True)[0]
-            best["comments"] = fetch_comments(best["url"])
-            best["source"] = "Reddit"
-            best["source_type"] = "Reddit"
-            all_candidates.append(best)
+            top_two = sorted(posts, key=lambda x: x["score"], reverse=True)[:2]
+            for post in top_two:
+                post["comments"] = fetch_comments(post["url"])
+                post["source"] = "Reddit (filtered)"
+                post["source_type"] = "Filtered Reddit"
+                filtered_reddit.append(post)
 
-    # 6. Dedupe by DOI/title (simple)
+    # ------------------------------------------------------------------
+    # 6. Combine all candidates and global dedupe
+    # ------------------------------------------------------------------
+    all_candidates = (
+        pubmed_selected +
+        biorxiv_selected +
+        author_selected +
+        top_reddit +
+        filtered_reddit
+    )
+
+    # Global dedupe (by DOI for papers, URL/title for Reddit)
     seen = set()
-    unique = []
+    unique_candidates = []
     for item in all_candidates:
-        key = item.get("doi") or item.get("title")
+        key = item.get("doi") or item.get("url") or item.get("title")
         if key and key not in seen:
             seen.add(key)
-            unique.append(item)
+            unique_candidates.append(item)
+    all_candidates = unique_candidates
 
-    logger.info(f"Collected {len(unique)} candidates.")
+    logger.info(f"Total unique candidates: {len(all_candidates)} (PubMed: {len(pubmed_selected)}, bioRxiv: {len(biorxiv_selected)}, Authors: {len(author_selected)}, Top Reddit: {len(top_reddit)}, Filtered Reddit: {len(filtered_reddit)})")
 
-    if not unique:
+    if not all_candidates:
         send_telegram("⚠️ No new relevant papers or posts found today.")
         return
 
+    # ------------------------------------------------------------------
     # 7. DeepSeek summarisation
-    summary_lines = deepseek_summarize(unique)
+    # ------------------------------------------------------------------
+    summary_lines = deepseek_summarize(all_candidates)
 
+    # ------------------------------------------------------------------
     # 8. Send to Telegram
+    # ------------------------------------------------------------------
     date_str = now.strftime("%B %d, %Y")
     if summary_lines and "Daily Digest" not in summary_lines[0]:
         summary_lines.insert(0, f"🧬 **Daily Digest – {date_str}**")
     final_msg = "\n".join(summary_lines)
     send_telegram(final_msg)
 
+    # ------------------------------------------------------------------
     # 9. Update cache
-    for item in unique:
+    # ------------------------------------------------------------------
+    for item in all_candidates:
         doi = item.get("doi")
         if doi:
             sent[doi] = time.time()
