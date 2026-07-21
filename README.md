@@ -65,6 +65,7 @@ Reddit votes and comments stabilise within 24–48 hours. The 1–8 day window:
 ### 1. GitHub Repository
 
 Create a new repository and push these files:
+.
 ├── .github/workflows/daily.yml
 ├── requirements.txt
 ├── daily_digest.py
