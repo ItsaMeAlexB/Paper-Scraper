@@ -1,39 +1,15 @@
-CACHE_FILE = "sent_doi_cache.txt"
-
-def load_cache():
-    try:
-        with open(CACHE_FILE, "r") as f:
-            return set(line.strip() for line in f)
-    except FileNotFoundError:
-        return set()
-
-def save_cache(ids):
-    with open(CACHE_FILE, "w") as f:
-        for doi in ids:
-            f.write(f"{doi}\n")
-
-# In main:
-sent = load_cache()
-all_items = [item for item in all_items if item.get("doi") not in sent]
-
-# After sending, add new DOIs to cache and save
-new_dois = [item["doi"] for item in selected if item.get("doi")]
-sent.update(new_dois)
-save_cache(sent)
-
 #!/usr/bin/env python3
 """
-Daily Digest – Gene Therapy / Editing / Delivery
-Scrapes PubMed, bioRxiv, Reddit; filters; summarises with DeepSeek; sends to Telegram.
+Daily Digest – Gene Therapy / Editing / Delivery / Engineering
+Scrapes PubMed, bioRxiv, Reddit; selects most significant; summarises with DeepSeek; sends to Telegram.
 """
 
 import os
-import re
 import sys
+import re
 import time
 import logging
-from datetime import datetime
-from collections import defaultdict
+from datetime import datetime, timedelta
 
 import requests
 import praw
@@ -49,16 +25,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "daily-digest/1.0")
-ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")  # Required by NCBI
+ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 
 # ----------------------------------------------------------------------
-# KEYWORDS (used for PubMed, bioRxiv, and filtered Reddit subs)
+# KEYWORDS
 # ----------------------------------------------------------------------
 
 KEYWORDS = [
     '"gene therapy"',
     '"gene editing"',
     '"gene delivery"',
+    '"gen* engineering"',
     '"machine learning" AND biochem*',
     '"bioinformatics" AND biochem*',
     '"DNA repair"',
@@ -66,7 +43,7 @@ KEYWORDS = [
 ]
 
 # ----------------------------------------------------------------------
-# ALWAYS‑INCLUDE AUTHORS (David Liu and Ciaran Lee)
+# ALWAYS-INCLUDE AUTHORS
 # ----------------------------------------------------------------------
 
 AUTHOR_RULES = [
@@ -94,18 +71,32 @@ AUTHOR_RULES = [
 # REDDIT CONFIGURATION
 # ----------------------------------------------------------------------
 
-# Subreddits that are fetched by "hot/top" (no keyword filter, only quality)
-TOP_SUBREDDITS = ["labrats", "bioinformatics", "machinelearning"]
+TOP_SUBREDDITS = ["labrats", "bioinformatics", "machinelearning", "GeneEditing"]
+FILTERED_SUBREDDITS = ["clinicaltrials", "biotech"]
 
-# Subreddits that are filtered by keywords + comment count
-FILTERED_SUBREDDITS = ["clinicaltrials", "biotech", "GeneEditing"]
+MIN_COMMENTS = 15
+REDDIT_WINDOW_START = 1   # 1 day old minimum
+REDDIT_WINDOW_END = 8     # 8 days old maximum
 
-# Minimum comments for top subreddits
-MIN_COMMENTS_TOP = 20
-MIN_COMMENTS_FILTERED = 15
+# ----------------------------------------------------------------------
+# TIME WINDOWS (papers: 4-5 weeks old)
+# ----------------------------------------------------------------------
 
-# Skip posts with these words in title or flair
-SKIP_WORDS = ["meme", "shitpost", "rant", "vent", "joke", "humor"]
+PAPER_WINDOW_START_DAYS = 35  # 5 weeks ago
+PAPER_WINDOW_END_DAYS = 28    # 4 weeks ago
+
+# ----------------------------------------------------------------------
+# CHARACTER CAPS (safe – above normal)
+# ----------------------------------------------------------------------
+
+CAPS = {
+    "abstract": 2000,
+    "selftext": 3000,
+    "comment": 500,
+    "reply": 300,
+}
+
+CACHE_TTL = 35 * 24 * 60 * 60  # 5 weeks
 
 # ----------------------------------------------------------------------
 # LOGGING
@@ -118,11 +109,53 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
+# CACHE
+# ----------------------------------------------------------------------
+
+CACHE_FILE = "sent_cache.txt"
+
+def load_cache():
+    cache = {}
+    try:
+        with open(CACHE_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split("|")
+                if len(parts) == 2:
+                    doi, ts = parts
+                    if time.time() - float(ts) < CACHE_TTL:
+                        cache[doi] = float(ts)
+    except FileNotFoundError:
+        pass
+    return cache
+
+def save_cache(cache):
+    with open(CACHE_FILE, "w") as f:
+        for doi, ts in cache.items():
+            f.write(f"{doi}|{ts}\n")
+
+# ----------------------------------------------------------------------
+# PEAK HOURS GUARDRAIL
+# ----------------------------------------------------------------------
+
+def is_peak_hours():
+    """DeepSeek peak pricing: Beijing 9-12 & 14-18 = UTC 1-4 & 6-10"""
+    h = datetime.utcnow().hour
+    return (1 <= h < 4) or (6 <= h < 10)
+
+def run_if_not_peak(max_attempts=2, wait_seconds=7200):
+    for attempt in range(max_attempts):
+        if not is_peak_hours():
+            return True
+        logger.info(f"Peak hours, waiting {wait_seconds}s (attempt {attempt+1}/{max_attempts})")
+        time.sleep(wait_seconds)
+    send_telegram("⏰ Still peak hours after retries. Skipping today.")
+    return False
+
+# ----------------------------------------------------------------------
 # HELPERS: PubMed
 # ----------------------------------------------------------------------
 
-def pubmed_search(query, retmax=200):
-    """Search PubMed and return list of PMIDs."""
+def pubmed_search(query, retmax=50):
     Entrez.email = ENTREZ_EMAIL
     handle = Entrez.esearch(db="pubmed", term=query, retmax=retmax)
     record = Entrez.read(handle)
@@ -130,7 +163,6 @@ def pubmed_search(query, retmax=200):
     return record["IdList"]
 
 def pubmed_fetch(pmids):
-    """Fetch full records for a list of PMIDs."""
     if not pmids:
         return []
     Entrez.email = ENTREZ_EMAIL
@@ -140,7 +172,6 @@ def pubmed_fetch(pmids):
     return records
 
 def extract_pubmed_data(record):
-    """Extract DOI, title, abstract, authors, journal, year."""
     doi = None
     for id_ in record.get("AID", []):
         if id_.endswith(" [doi]"):
@@ -152,7 +183,7 @@ def extract_pubmed_data(record):
         "abstract": record.get("AB", ""),
         "authors": record.get("AU", []),
         "journal": record.get("JT", ""),
-        "year": record.get("DP", "")[:4],
+        "date": record.get("DP", ""),
         "source": "PubMed",
         "pmid": record.get("PMID", ""),
     }
@@ -163,8 +194,7 @@ def extract_pubmed_data(record):
 
 BIORXIV_API = "https://api.biorxiv.org/details/biorxiv/"
 
-def biorxiv_search(query, limit=200):
-    """Search bioRxiv by keyword (full‑text search)."""
+def biorxiv_search(query, limit=50):
     url = f"{BIORXIV_API}{query}/{limit}/0/json"
     try:
         resp = requests.get(url, timeout=30)
@@ -176,60 +206,41 @@ def biorxiv_search(query, limit=200):
         return []
 
 def parse_biorxiv_paper(paper):
-    """Convert bioRxiv API item to common dict."""
     return {
         "doi": paper.get("doi"),
         "title": paper.get("title", ""),
         "abstract": paper.get("abstract", ""),
         "authors": paper.get("authors", "").split(", "),
         "journal": "bioRxiv",
-        "year": paper.get("date", "")[:4],
+        "date": paper.get("date", ""),
         "source": "bioRxiv",
         "pmid": None,
     }
 
 # ----------------------------------------------------------------------
-# HELPERS: PubPeer
+# HELPERS: PubPeer (never cancel, just note)
 # ----------------------------------------------------------------------
 
 PUBPEER_API = "https://pubpeer.com/api/v2/publications"
 
-def get_pubpeer_comments(doi):
-    """Return list of comments with sentiment classification (critical/non‑critical)."""
+def get_pubpeer_note(doi):
     if not doi:
-        return []
+        return "No PubPeer data"
     try:
         resp = requests.get(f"{PUBPEER_API}/{doi}", timeout=20)
         if resp.status_code == 404:
-            return []
+            return "No PubPeer comments"
         resp.raise_for_status()
         data = resp.json()
-        # Comments are inside data['evaluation_summary']
-        comments = []
-        for eval_ in data.get("evaluation_summary", []):
-            text = eval_.get("comment", "")
-            # Heuristic: flag as critical if contains certain words
-            critical_words = ["retract", "fabricat", "manipul", "fals", "inconsist", "concern", "error"]
-            is_critical = any(w in text.lower() for w in critical_words)
-            comments.append({
-                "text": text,
-                "is_critical": is_critical,
-            })
-        return comments
+        comments = data.get("evaluation_summary", [])
+        if not comments:
+            return "No PubPeer comments"
+        total = len(comments)
+        critical = sum(1 for c in comments if any(w in c.get("comment", "").lower() for w in ["retract", "fabricat", "manipul", "fals", "inconsist", "concern", "error"]))
+        return f"{total} comments ({critical} critical)"
     except Exception as e:
         logger.warning(f"PubPeer fetch failed for {doi}: {e}")
-        return []
-
-def should_keep_paper(paper, is_always_include=False):
-    """Check PubPeer: discard if ≥2 critical comments and not always‑include."""
-    if is_always_include:
-        return True
-    comments = get_pubpeer_comments(paper.get("doi"))
-    critical = [c for c in comments if c["is_critical"]]
-    if len(critical) >= 2:
-        logger.info(f"Discarding {paper.get('doi')} due to {len(critical)} critical PubPeer comments.")
-        return False
-    return True
+        return "PubPeer fetch failed"
 
 # ----------------------------------------------------------------------
 # HELPERS: Reddit
@@ -242,129 +253,103 @@ def init_reddit():
         user_agent=REDDIT_USER_AGENT,
     )
 
-def fetch_top_posts(subreddit_name, limit=50, min_comments=MIN_COMMENTS_TOP):
-    """Fetch top posts from a subreddit (day), apply quality filters."""
+def fetch_reddit_posts(subreddit_name, keywords=None, limit=50):
     reddit = init_reddit()
     sub = reddit.subreddit(subreddit_name)
     posts = []
-    for post in sub.top(time_filter="day", limit=limit):
+    now = datetime.utcnow()
+    for post in sub.top(time_filter="week", limit=limit):
+        post_age_days = (now - datetime.utcfromtimestamp(post.created_utc)).days
+        if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
+            continue
         if post.score < 0:
             continue
-        if any(w in post.title.lower() for w in SKIP_WORDS):
+        if post.num_comments < MIN_COMMENTS:
             continue
-        if post.num_comments < min_comments:
-            continue
-        # Flair check
-        if post.link_flair_text and any(w in post.link_flair_text.lower() for w in SKIP_WORDS):
-            continue
+        # Keyword filter for filtered subs
+        if keywords:
+            text = (post.title + " " + post.selftext).lower()
+            if not any(re.search(kw.lower(), text) for kw in keywords):
+                continue
         posts.append({
             "title": post.title,
             "url": post.url,
             "score": post.score,
             "num_comments": post.num_comments,
             "subreddit": subreddit_name,
-            "created_utc": datetime.utcfromtimestamp(post.created_utc),
-            "selftext": post.selftext[:1000],  # limit
-            "comments": [],  # will be fetched later
+            "created_utc": post.created_utc,
+            "selftext": post.selftext[:CAPS["selftext"]],
         })
     return posts
 
-def fetch_filtered_posts(subreddit_name, keywords, limit=50, min_comments=MIN_COMMENTS_FILTERED):
-    """Fetch hot posts and filter by keyword in title/selftext."""
+def fetch_comments(post_url):
     reddit = init_reddit()
-    sub = reddit.subreddit(subreddit_name)
-    posts = []
-    for post in sub.hot(limit=limit):
-        if post.score < 0:
-            continue
-        if any(w in post.title.lower() for w in SKIP_WORDS):
-            continue
-        if post.link_flair_text and any(w in post.link_flair_text.lower() for w in SKIP_WORDS):
-            continue
-        if post.num_comments < min_comments:
-            continue
-        text = (post.title + " " + post.selftext).lower()
-        # Check any keyword pattern (simple OR)
-        if any(re.search(kw.lower(), text) for kw in keywords):
-            posts.append({
-                "title": post.title,
-                "url": post.url,
-                "score": post.score,
-                "num_comments": post.num_comments,
-                "subreddit": subreddit_name,
-                "created_utc": datetime.utcfromtimestamp(post.created_utc),
-                "selftext": post.selftext[:1000],
-                "comments": [],
-            })
-    return posts
-
-def fetch_comments_for_post(post_dict, limit=20):
-    """Fetch top-level comments and return list of strings."""
-    reddit = init_reddit()
-    submission = reddit.submission(url=post_dict["url"])
+    submission = reddit.submission(url=post_url)
     submission.comments.replace_more(limit=0)
-    comments = [c.body for c in submission.comments[:limit] if hasattr(c, "body")]
-    return comments
+    top_comments = sorted(submission.comments, key=lambda c: c.score, reverse=True)[:3]
+    result = []
+    for c in top_comments:
+        comment_text = c.body[:CAPS["comment"]]
+        if len(c.body) > CAPS["comment"]:
+            logger.info(f"Comment truncated for {post_url} (len={len(c.body)})")
+        replies = sorted(c.replies, key=lambda r: r.score, reverse=True)[:1]
+        reply_text = replies[0].body[:CAPS["reply"]] if replies else ""
+        if replies and len(replies[0].body) > CAPS["reply"]:
+            logger.info(f"Reply truncated for {post_url} (len={len(replies[0].body)})")
+        result.append({
+            "comment": comment_text,
+            "score": c.score,
+            "reply": reply_text,
+            "reply_score": replies[0].score if replies else 0,
+        })
+    return result
 
 # ----------------------------------------------------------------------
-# DEEPSEEK API
+# DEEPSEEK
 # ----------------------------------------------------------------------
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-def deepseek_summarize(items, prompt_suffix=""):
-    """
-    Send a batch of items to DeepSeek and ask for top 5 summaries.
-    items: list of dicts with keys: title, abstract/summary, source, type
-    Returns: list of strings (formatted as per example).
-    """
-    if not items:
-        return []
-
-    # Build the prompt
-    texts = []
-    for i, item in enumerate(items, 1):
-        title = item.get("title", "Untitled")
-        abstract = item.get("abstract", item.get("selftext", ""))[:500]
-        source = item.get("source", "Unknown")
-        if "preprint" in source.lower():
-            tag = "[Preprint]"
-        elif "reddit" in source.lower():
-            tag = f"[Post] r/{item.get('subreddit','')}"
-        else:
-            tag = f"[{source}]"
-        texts.append(f"{i}. {tag} {title}\n   {abstract}")
+def deepseek_summarize(candidates):
+    if not candidates:
+        return ["No candidates found today."]
 
     prompt = f"""
-You are a scientific summariser. Below is a list of papers and Reddit posts about gene therapy, gene editing, gene delivery, DNA repair, epigenetics, bioinformatics, or machine learning in biochemistry.
+You are a scientific summariser for gene therapy researchers.
 
-From this list, select the **5 most significant** items for a gene therapy researcher. **Always include** any papers from David Liu or Ciaran Lee labs (if present).
+You will receive a list of candidates from PubMed, bioRxiv, and Reddit.
+Your tasks:
 
-For each selected item, write **2–3 sentences** covering:
-- What was done
-- What was found
-- How (method / approach)
+1. **Select the most significant item per category** (one per keyword for PubMed/bioRxiv, one per author, one per subreddit).
+2. **Prioritise** papers where gene editing, delivery, therapy, or engineering is the **core focus**.
+3. If no such paper exists for a keyword, still include the best available match.
+4. For each selected item, write **2–3 sentences** covering:
+   - What was done
+   - What was found
+   - How (method/approach)
 
-Format your answer exactly like this:
+Output format (sections):
 
 🧬 **Daily Digest – [Date]**
 
-1. [Preprint] Liu Lab: "Title" – explanation...
-2. [Post] r/biotech: "Title" – explanation...
-... (5 items total)
+**PubMed / bioRxiv:**
+1. [source] "title" – summary... (PubPeer: note)
 
-List of items:
+**Named authors:**
+1. [source] "title" – summary... (PubPeer: note)
 
-{chr(10).join(texts)}
+**Reddit:**
+1. [Post] r/subreddit: "title" – summary... (Top comment: "quote" [+score])
 
-{chr(10)}{prompt_suffix}
+Candidates:
+{chr(10).join([f"- {i.get('source')}: {i.get('title')} | {i.get('abstract', i.get('selftext', ''))[:CAPS['abstract']]} | PubPeer: {i.get('pubpeer_note', 'N/A')}" for i in candidates])}
 """
 
     payload = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 800,
+        "max_tokens": 1200,
     }
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -394,179 +379,145 @@ def send_telegram(message):
         logger.error(f"Telegram send failed: {e}")
 
 # ----------------------------------------------------------------------
-# MAIN PIPELINE
+# MAIN
 # ----------------------------------------------------------------------
 
 def main():
+    if not run_if_not_peak():
+        return
+
     logger.info("Starting daily digest...")
-    all_items = []
+    sent = load_cache()
+    all_candidates = []
+    now = datetime.now()
 
-    # 1. Fetch PubMed papers (keywords + always‑include authors)
-    pubmed_items = []
-
-    # Keyword search
+    # 1. PubMed (search terms)
     for kw in KEYWORDS:
         logger.info(f"PubMed keyword: {kw}")
-        pmids = pubmed_search(kw, retmax=100)
+        pmids = pubmed_search(kw, retmax=50)
         if pmids:
             records = pubmed_fetch(pmids)
             for rec in records:
                 data = extract_pubmed_data(rec)
-                if data["doi"]:
-                    pubmed_items.append(data)
+                if data["doi"] and data["doi"] not in sent:
+                    # Check age window (4-5 weeks)
+                    try:
+                        pub_date = datetime.strptime(data["date"], "%Y %b %d")
+                    except:
+                        continue
+                    age_days = (now - pub_date).days
+                    if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                        data["pubpeer_note"] = get_pubpeer_note(data["doi"])
+                        data["source_type"] = "PubMed"
+                        all_candidates.append(data)
 
-    # Always‑include authors
+    # 2. bioRxiv (search terms)
+    for kw in KEYWORDS:
+        query = kw.replace('"', '').replace(' AND ', '+').replace(' ', '+')
+        logger.info(f"bioRxiv keyword: {query}")
+        papers = biorxiv_search(query, limit=50)
+        for p in papers:
+            data = parse_biorxiv_paper(p)
+            if data["doi"] and data["doi"] not in sent:
+                try:
+                    pub_date = datetime.strptime(data["date"], "%Y-%m-%d")
+                except:
+                    continue
+                age_days = (now - pub_date).days
+                if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                    data["pubpeer_note"] = get_pubpeer_note(data["doi"])
+                    data["source_type"] = "bioRxiv"
+                    all_candidates.append(data)
+
+    # 3. Named authors (separate, always include)
     for author_rule in AUTHOR_RULES:
         for query in author_rule["pubmed_queries"]:
-            logger.info(f"PubMed author query: {query}")
-            pmids = pubmed_search(query, retmax=50)
+            logger.info(f"PubMed author: {query}")
+            pmids = pubmed_search(query, retmax=10)
             if pmids:
                 records = pubmed_fetch(pmids)
                 for rec in records:
                     data = extract_pubmed_data(rec)
-                    if data["doi"]:
-                        # Mark as always‑include
-                        data["always_include"] = True
-                        data["author_label"] = author_rule["name"]
-                        pubmed_items.append(data)
-
-    # Deduplicate PubMed by DOI
-    seen = set()
-    unique_pubmed = []
-    for item in pubmed_items:
-        doi = item["doi"]
-        if doi and doi not in seen:
-            seen.add(doi)
-            unique_pubmed.append(item)
-    logger.info(f"PubMed: {len(unique_pubmed)} unique items before PubPeer filter.")
-
-    # PubPeer filter (keep always‑include)
-    for item in unique_pubmed:
-        is_always = item.get("always_include", False)
-        if should_keep_paper(item, is_always):
-            item["source"] = "PubMed"
-            all_items.append(item)
-
-    # 2. Fetch bioRxiv papers
-    biorxiv_items = []
-
-    # Keyword search
-    for kw in KEYWORDS:
-        # bioRxiv API uses spaces as OR, but we need to handle quotes
-        query = kw.replace('"', '').replace(' AND ', '+').replace(' ', '+')
-        logger.info(f"bioRxiv keyword: {query}")
-        papers = biorxiv_search(query, limit=100)
-        for p in papers:
-            data = parse_biorxiv_paper(p)
-            if data["doi"]:
-                biorxiv_items.append(data)
-
-    # Always‑include authors (name search)
-    for author_rule in AUTHOR_RULES:
+                    if data["doi"] and data["doi"] not in sent:
+                        try:
+                            pub_date = datetime.strptime(data["date"], "%Y %b %d")
+                        except:
+                            continue
+                        age_days = (now - pub_date).days
+                        if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                            data["pubpeer_note"] = get_pubpeer_note(data["doi"])
+                            data["source_type"] = "Named author"
+                            data["author_label"] = author_rule["name"]
+                            all_candidates.append(data)
+        # bioRxiv author search
         query = author_rule["biorxiv_query"].replace('"', '').replace(' ', '+')
-        logger.info(f"bioRxiv author query: {query}")
-        papers = biorxiv_search(query, limit=50)
+        papers = biorxiv_search(query, limit=10)
         for p in papers:
             data = parse_biorxiv_paper(p)
-            if data["doi"]:
-                data["always_include"] = True
-                data["author_label"] = author_rule["name"]
-                biorxiv_items.append(data)
+            if data["doi"] and data["doi"] not in sent:
+                try:
+                    pub_date = datetime.strptime(data["date"], "%Y-%m-%d")
+                except:
+                    continue
+                age_days = (now - pub_date).days
+                if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                    data["pubpeer_note"] = get_pubpeer_note(data["doi"])
+                    data["source_type"] = "Named author"
+                    data["author_label"] = author_rule["name"]
+                    all_candidates.append(data)
 
-    # Deduplicate
-    seen = set()
-    unique_biorxiv = []
-    for item in biorxiv_items:
-        doi = item["doi"]
-        if doi and doi not in seen:
-            seen.add(doi)
-            unique_biorxiv.append(item)
-    logger.info(f"bioRxiv: {len(unique_biorxiv)} unique items before PubPeer filter.")
-
-    for item in unique_biorxiv:
-        is_always = item.get("always_include", False)
-        if should_keep_paper(item, is_always):
-            item["source"] = "bioRxiv"
-            all_items.append(item)
-
-    # 3. Reddit – top subreddits (no keyword filter)
-    reddit_items = []
+    # 4. Reddit (top subs)
     for sub in TOP_SUBREDDITS:
-        logger.info(f"Fetching top posts from r/{sub}")
-        posts = fetch_top_posts(sub, limit=50)
-        for post in posts:
-            # Fetch comments for sentiment later
-            post["comments"] = fetch_comments_for_post(post, limit=15)
-            post["source"] = "Reddit"
-            reddit_items.append(post)
+        posts = fetch_reddit_posts(sub, keywords=None)
+        if posts:
+            best = sorted(posts, key=lambda x: x["score"], reverse=True)[0]
+            best["comments"] = fetch_comments(best["url"])
+            best["source"] = "Reddit"
+            best["source_type"] = "Reddit"
+            all_candidates.append(best)
 
-    # 4. Reddit – filtered subreddits
+    # 5. Reddit (filtered subs)
     for sub in FILTERED_SUBREDDITS:
-        logger.info(f"Fetching filtered posts from r/{sub}")
-        posts = fetch_filtered_posts(sub, KEYWORDS, limit=50)
-        for post in posts:
-            post["comments"] = fetch_comments_for_post(post, limit=15)
-            post["source"] = "Reddit"
-            reddit_items.append(post)
+        posts = fetch_reddit_posts(sub, keywords=KEYWORDS)
+        if posts:
+            best = sorted(posts, key=lambda x: x["score"], reverse=True)[0]
+            best["comments"] = fetch_comments(best["url"])
+            best["source"] = "Reddit"
+            best["source_type"] = "Reddit"
+            all_candidates.append(best)
 
-    logger.info(f"Reddit: {len(reddit_items)} posts fetched.")
-    all_items.extend(reddit_items)
+    # 6. Dedupe by DOI/title (simple)
+    seen = set()
+    unique = []
+    for item in all_candidates:
+        key = item.get("doi") or item.get("title")
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(item)
 
-    # 5. If no items, send a fallback message and exit
-    if not all_items:
+    logger.info(f"Collected {len(unique)} candidates.")
+
+    if not unique:
         send_telegram("⚠️ No new relevant papers or posts found today.")
         return
 
-# 6. Filter to last 7 days only
-cutoff = datetime.now() - timedelta(days=7)
-all_items = [
-    item for item in all_items
-    if item.get("created_utc", datetime.now()) >= cutoff
-]
-
-# 7. Separate always-include authors
-always = [i for i in all_items if i.get("always_include")]
-others = [i for i in all_items if not i.get("always_include")]
-
-# 8. Pick exactly 5 from each source (PubMed, bioRxiv, Reddit)
-#    For Reddit, combine all subreddits and pick top 5 by score
-def pick_top(items, n=5):
-    return sorted(items, key=lambda x: x.get("score", 0), reverse=True)[:n]
-
-source_sampled = {
-    "PubMed": pick_top([i for i in others if i.get("source") == "PubMed"]),
-    "bioRxiv": pick_top([i for i in others if i.get("source") == "bioRxiv"]),
-    "Reddit": pick_top([i for i in others if i.get("source") == "Reddit"]),
-}
-
-# 9. Combine: always-include (unlimited, but typically 1-2/day) + top 5 from each source
-selected = always + source_sampled["PubMed"] + source_sampled["bioRxiv"] + source_sampled["Reddit"]
-
-# 10. If > 20, trim to top 20 by score (to avoid token issues)
-if len(selected) > 20:
-    selected = sorted(selected, key=lambda x: x.get("score", 0), reverse=True)[:20]
-
-# 11. Now send selected to DeepSeek
-
-    # 7. Call DeepSeek
-    logger.info("Sending items to DeepSeek for summarisation...")
-    summary_lines = deepseek_summarize(all_items)
-
-    if not summary_lines:
-        # fallback: send raw list
-        fallback = "DeepSeek summary failed. Raw items:\n"
-        for i, item in enumerate(all_items[:10], 1):
-            fallback += f"{i}. {item.get('title', 'No title')}\n"
-        send_telegram(fallback)
-        return
+    # 7. DeepSeek summarisation
+    summary_lines = deepseek_summarize(unique)
 
     # 8. Send to Telegram
-    date_str = datetime.now().strftime("%B %d, %Y")
-    # Insert date into first line if not present
+    date_str = now.strftime("%B %d, %Y")
     if summary_lines and "Daily Digest" not in summary_lines[0]:
         summary_lines.insert(0, f"🧬 **Daily Digest – {date_str}**")
     final_msg = "\n".join(summary_lines)
     send_telegram(final_msg)
+
+    # 9. Update cache
+    for item in unique:
+        doi = item.get("doi")
+        if doi:
+            sent[doi] = time.time()
+    save_cache(sent)
+
     logger.info("Digest sent successfully.")
 
 if __name__ == "__main__":
