@@ -12,11 +12,14 @@ This script scrapes:
 It then:
 - Filters for papers **4–5 weeks old** (to allow PubPeer comments to appear)
 - Filters Reddit posts **1–8 days old** (to allow votes/comments to settle)
-- Checks PubPeer (notes comments, never cancels)
-- Sends all candidates to **DeepSeek API** for selection and 2–3 sentence summarisation
-- Delivers a formatted daily digest via **Telegram**
+- For **PubMed/bioRxiv**: takes the **3 oldest** papers per source (closest to 5 weeks) and sends them to DeepSeek, which selects **1 most significant** overall.
+- For **named authors** (David Liu, Ciaran Lee): takes the **1 oldest** paper per author and summarises directly (no selection).
+- For **top Reddit subs** (`r/labrats`, `r/bioinformatics`, `r/machinelearning`, `r/GeneEditing`): takes **1 highest-rated** post per sub and summarises directly (no relevance filter).
+- For **filtered Reddit subs** (`r/clinicaltrials`, `r/biotech`): takes **2 highest-rated** posts per sub and sends them to DeepSeek, which **evaluates relevance** and includes only those clearly matching your keywords.
+- Checks PubPeer (notes comments, never cancels papers or posts).
+- Delivers a formatted daily digest via **Telegram** with separate sections for papers, authors, and Reddit.
 
-## Search Keywords
+## Search Keywords (for PubMed, bioRxiv, and relevance evaluation on filtered Reddit)
 
 - `"gene therapy"`
 - `"gene editing"`
@@ -32,7 +35,7 @@ It then:
 - David Liu (ORCID: 0000-0002-9943-7557)
 - Ciaran Lee (ORCID: 0000-0002-0789-9149)
 
-Papers from these authors are always included in the digest.
+Papers from these authors are always included in the digest (1 oldest each, summarised directly).
 
 ## Character Caps (Safe – Above Normal)
 
@@ -104,19 +107,23 @@ Push to GitHub. The workflow runs daily at **20:00 UTC** (avoids DeepSeek peak p
 ```
 🧬 **Daily Digest – [Date]**
 
-**PubMed / bioRxiv:**
+**PubMed / bioRxiv (most significant):**
 1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
 **Named authors:**
 1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
 
-**Reddit:**
+**Reddit (top subs):**
+1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
+
+**Reddit (filtered subs – relevant only):**
 1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
 ```
 
 ## Design Rationale
 
-- **No DeepSeek filtering**: Prevents false negatives where a paper is relevant but the AI misclassifies it.
+- **No local relevance filtering for filtered Reddit**: DeepSeek evaluates relevance, avoiding false negatives from simplistic keyword matching.
+- **3 oldest papers per source**: Gives DeepSeek enough options to pick the most significant, while ensuring we see the earliest (closest to 5 weeks) publications.
 - **PubPeer never cancels**: Comments are noted but papers are never removed.
 - **Reddit not filtered by keywords for top subs**: Useful lab advice, career posts, and discussions are caught even if they don't match keywords.
 - **Character caps above normal**: Ensure no meaningful content is lost while preventing rants from clogging the system.
