@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Daily Digest – Gene Therapy / Editing / Delivery / Engineering
-Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit; selects most significant; summarises with DeepSeek; sends to Telegram.
+Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit; selects most significant;
+summarises with DeepSeek; sends to Telegram.
 """
 
 import os
@@ -16,7 +17,7 @@ import praw
 from Bio import Entrez, Medline
 
 # ----------------------------------------------------------------------
-# CONFIGURATION (reads from environment)
+# CONFIGURATION (environment variables)
 # ----------------------------------------------------------------------
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
@@ -28,22 +29,34 @@ REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "daily-digest/1.0")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 
 # ----------------------------------------------------------------------
-# KEYWORDS
+# SEARCH TERMS
 # ----------------------------------------------------------------------
 
 KEYWORDS = [
     '"gene therapy"',
     '"gene editing"',
     '"gene delivery"',
-    '"gen* engineering"',
-    '"machine learning" AND biochem*',
-    '"bioinformatics" AND biochem*',
+    'cell* AND immun*',
+    'bioinformatic*',
+    '"computational biolog*"',
     '"DNA repair"',
-    '"epigenetic*"',
+    'epigenetic*',
+    'manufactur*',
+    'discover* OR engineer*',
+]
+
+# ClinicalTrials.gov only uses a subset
+CT_KEYWORDS = [
+    '"gene therapy"',
+    '"gene editing"',
+    '"gene delivery"',
+    'cell* AND immun*',
+    '"DNA repair"',
+    'epigenetic*',
 ]
 
 # ----------------------------------------------------------------------
-# ALWAYS-INCLUDE AUTHORS
+# AUTHORS TO ALWAYS INCLUDE
 # ----------------------------------------------------------------------
 
 AUTHOR_RULES = [
@@ -68,13 +81,25 @@ AUTHOR_RULES = [
 ]
 
 # ----------------------------------------------------------------------
-# REDDIT CONFIGURATION
+# REDDIT SUBREDDITS
 # ----------------------------------------------------------------------
 
-TOP_SUBREDDITS = ["labrats", "bioinformatics", "machinelearning", "GeneEditing"]
-FILTERED_SUBREDDITS = ["clinicaltrials", "biotech"]
+SUBREDDITS = [
+    "labrats",
+    "bioinformatics",
+    "machinelearning",
+    "GeneEditing",
+    "clinicaltrials",
+    "biotech",
+    "computationalbiology",
+    "immunology",
+    "biochemistry",
+    "molecularbiology",
+    "cellbiology",
+    "statistics",
+]
 
-MIN_COMMENTS = 15
+MIN_REDDIT_COMMENTS = 15
 REDDIT_WINDOW_START = 1   # 1 day old minimum
 REDDIT_WINDOW_END = 8     # 8 days old maximum
 
@@ -86,7 +111,7 @@ PAPER_WINDOW_START_DAYS = 35  # 5 weeks ago
 PAPER_WINDOW_END_DAYS = 28    # 4 weeks ago
 
 # ----------------------------------------------------------------------
-# CHARACTER CAPS (safe – above normal)
+# CHARACTER CAPS
 # ----------------------------------------------------------------------
 
 CAPS = {
@@ -96,7 +121,53 @@ CAPS = {
     "reply": 300,
 }
 
+# ----------------------------------------------------------------------
+# CACHE
+# ----------------------------------------------------------------------
+
 CACHE_TTL = 35 * 24 * 60 * 60  # 5 weeks
+CACHE_FILE = "sent_cache.txt"
+LAST_RUN_FILE = "last_run_date.txt"
+
+def load_cache():
+    cache = {}
+    try:
+        with open(CACHE_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split("|")
+                if len(parts) == 2:
+                    key, ts = parts
+                    if time.time() - float(ts) < CACHE_TTL:
+                        cache[key] = float(ts)
+    except FileNotFoundError:
+        pass
+    return cache
+
+def save_cache(cache):
+    with open(CACHE_FILE, "w") as f:
+        for key, ts in cache.items():
+            f.write(f"{key}|{ts}\n")
+
+def already_run_today():
+    try:
+        with open(LAST_RUN_FILE, "r") as f:
+            last_date = f.read().strip()
+            return last_date == datetime.utcnow().strftime("%Y-%m-%d")
+    except FileNotFoundError:
+        return False
+
+def mark_run_today():
+    with open(LAST_RUN_FILE, "w") as f:
+        f.write(datetime.utcnow().strftime("%Y-%m-%d"))
+
+# ----------------------------------------------------------------------
+# PEAK HOURS GUARDRAIL
+# ----------------------------------------------------------------------
+
+def is_peak_hours():
+    """DeepSeek peak pricing: Beijing 9-12 & 14-18 = UTC 1-4 & 6-10"""
+    h = datetime.utcnow().hour
+    return (1 <= h < 4) or (6 <= h < 10)
 
 # ----------------------------------------------------------------------
 # LOGGING
@@ -109,47 +180,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# CACHE
+# RETRY WRAPPER
 # ----------------------------------------------------------------------
 
-CACHE_FILE = "sent_cache.txt"
-
-def load_cache():
-    cache = {}
-    try:
-        with open(CACHE_FILE, "r") as f:
-            for line in f:
-                parts = line.strip().split("|")
-                if len(parts) == 2:
-                    doi, ts = parts
-                    if time.time() - float(ts) < CACHE_TTL:
-                        cache[doi] = float(ts)
-    except FileNotFoundError:
-        pass
-    return cache
-
-def save_cache(cache):
-    with open(CACHE_FILE, "w") as f:
-        for doi, ts in cache.items():
-            f.write(f"{doi}|{ts}\n")
-
-# ----------------------------------------------------------------------
-# PEAK HOURS GUARDRAIL
-# ----------------------------------------------------------------------
-
-def is_peak_hours():
-    """DeepSeek peak pricing: Beijing 9-12 & 14-18 = UTC 1-4 & 6-10"""
-    h = datetime.utcnow().hour
-    return (1 <= h < 4) or (6 <= h < 10)
-
-def run_if_not_peak(max_attempts=2, wait_seconds=7200):
-    for attempt in range(max_attempts):
-        if not is_peak_hours():
-            return True
-        logger.info(f"Peak hours, waiting {wait_seconds}s (attempt {attempt+1}/{max_attempts})")
-        time.sleep(wait_seconds)
-    send_telegram("⏰ Still peak hours after retries. Skipping today.")
-    return False
+def fetch_with_retry(fetch_func, *args, retries=2, delay=5, **kwargs):
+    """Try a fetch function twice; sleep `delay` seconds between attempts."""
+    for attempt in range(retries):
+        try:
+            result = fetch_func(*args, **kwargs)
+            if result:  # non-empty (list, dict, etc.)
+                return result
+        except Exception as e:
+            logger.warning(f"Fetch attempt {attempt+1} failed: {e}")
+        if attempt < retries - 1:
+            logger.info(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
+    return []  # fallback empty result
 
 # ----------------------------------------------------------------------
 # HELPERS: PubMed
@@ -165,7 +211,7 @@ def parse_pubmed_date(dp):
             continue
     return None
 
-def pubmed_search(query, retmax=50):
+def pubmed_search(query, retmax=100):
     Entrez.email = ENTREZ_EMAIL
     handle = Entrez.esearch(db="pubmed", term=query, retmax=retmax)
     record = Entrez.read(handle)
@@ -194,9 +240,27 @@ def extract_pubmed_data(record):
         "authors": record.get("AU", []),
         "journal": record.get("JT", ""),
         "date": record.get("DP", ""),
-        "source": "PubMed",
         "pmid": record.get("PMID", ""),
     }
+
+def fetch_pubmed_abstract_by_doi(doi):
+    """Return abstract and journal for a DOI, or None if not found."""
+    try:
+        pmids = pubmed_search(f'{doi}[doi]', retmax=1)
+        if not pmids:
+            return None
+        records = pubmed_fetch(pmids)
+        if not records:
+            return None
+        rec = records[0]
+        return {
+            "abstract": rec.get("AB", ""),
+            "journal": rec.get("JT", ""),
+            "title": rec.get("TI", ""),
+            "authors": rec.get("AU", []),
+        }
+    except Exception:
+        return None
 
 # ----------------------------------------------------------------------
 # HELPERS: bioRxiv
@@ -204,16 +268,12 @@ def extract_pubmed_data(record):
 
 BIORXIV_API = "https://api.biorxiv.org/details/biorxiv/"
 
-def biorxiv_search(query, limit=50):
+def biorxiv_search(query, limit=100):
     url = f"{BIORXIV_API}{query}/{limit}/0/json"
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("collection", [])
-    except Exception as e:
-        logger.error(f"bioRxiv search failed: {e}")
-        return []
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("collection", [])
 
 def parse_biorxiv_paper(paper):
     return {
@@ -223,8 +283,6 @@ def parse_biorxiv_paper(paper):
         "authors": paper.get("authors", "").split(", "),
         "journal": "bioRxiv",
         "date": paper.get("date", ""),
-        "source": "bioRxiv",
-        "pmid": None,
     }
 
 # ----------------------------------------------------------------------
@@ -233,8 +291,7 @@ def parse_biorxiv_paper(paper):
 
 CLINICALTRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
-def clinicaltrials_search(query, limit=50):
-    """Search ClinicalTrials.gov by keyword, filtering by active/recruiting/completed statuses."""
+def clinicaltrials_search(query, limit=100):
     status_filter = (
         "AREA[OverallStatus]ACTIVE OR "
         "AREA[OverallStatus]NOT_YET_RECRUITING OR "
@@ -248,14 +305,10 @@ def clinicaltrials_search(query, limit=50):
         "pageSize": min(limit, 100),
         "format": "json",
     }
-    try:
-        resp = requests.get(CLINICALTRIALS_API, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("studies", [])
-    except Exception as e:
-        logger.error(f"ClinicalTrials.gov search failed: {e}")
-        return []
+    resp = requests.get(CLINICALTRIALS_API, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("studies", [])
 
 def parse_clinicaltrial_date(dp):
     if not dp:
@@ -266,22 +319,33 @@ def parse_clinicaltrial_date(dp):
         return None
 
 def parse_clinicaltrial(study):
-    """Extract key fields from a ClinicalTrials.gov study object."""
     protocol = study.get("protocolSection", {})
     id_module = protocol.get("identificationModule", {})
     status_module = protocol.get("statusModule", {})
     design_module = protocol.get("designModule", {})
     conditions_module = protocol.get("conditionsModule", {})
     interventions_module = protocol.get("interventionsModule", {})
-    
+    refs_module = protocol.get("referencesModule", {})
+
     date_str = status_module.get("lastUpdatePostDate") or status_module.get("firstPostedDate") or ""
-    
     summary = (conditions_module.get("briefSummary", "") or "")
     if not summary:
         summary = conditions_module.get("detailedDescription", "") or ""
-    
+
+    # Extract linked references (look for PMID or DOI)
+    linked_refs = []
+    for ref in refs_module.get("references", []):
+        citation = ref.get("citation", "")
+        if "doi" in citation.lower():
+            match = re.search(r'10\.\d+/\S+', citation)
+            if match:
+                linked_refs.append({"type": "doi", "id": match.group()})
+        elif "pmid" in citation.lower():
+            match = re.search(r'\d{8}', citation)
+            if match:
+                linked_refs.append({"type": "pmid", "id": match.group()})
+
     return {
-        "doi": None,
         "nct_id": id_module.get("nctId"),
         "title": id_module.get("briefTitle") or id_module.get("officialTitle") or "",
         "abstract": summary[:CAPS["abstract"]],
@@ -291,12 +355,23 @@ def parse_clinicaltrial(study):
         "status": status_module.get("overallStatus", ""),
         "enrollment": design_module.get("enrollmentInfo", {}).get("count", ""),
         "date": date_str,
+        "linked_refs": linked_refs,
         "source": "ClinicalTrials.gov",
-        "pmid": None,
     }
 
+def get_paper_from_clinicaltrial_refs(linked_refs):
+    """Try to fetch abstract/journal from linked references."""
+    for ref in linked_refs:
+        if ref["type"] == "doi":
+            result = fetch_pubmed_abstract_by_doi(ref["id"])
+            if result:
+                return result
+        elif ref["type"] == "pmid":
+            continue
+    return None
+
 # ----------------------------------------------------------------------
-# HELPERS: PubPeer (never cancel, just note)
+# HELPERS: PubPeer
 # ----------------------------------------------------------------------
 
 PUBPEER_API = "https://pubpeer.com/api/v2/publications"
@@ -304,21 +379,27 @@ PUBPEER_API = "https://pubpeer.com/api/v2/publications"
 def get_pubpeer_note(identifier):
     if not identifier:
         return "No PubPeer data"
-    try:
-        resp = requests.get(f"{PUBPEER_API}/{identifier}", timeout=20)
-        if resp.status_code == 404:
-            return "No PubPeer comments"
-        resp.raise_for_status()
-        data = resp.json()
-        comments = data.get("evaluation_summary", [])
-        if not comments:
-            return "No PubPeer comments"
-        total = len(comments)
-        critical = sum(1 for c in comments if any(w in c.get("comment", "").lower() for w in ["retract", "fabricat", "manipul", "fals", "inconsist", "concern", "error"]))
-        return f"{total} comments ({critical} critical)"
-    except Exception as e:
-        logger.warning(f"PubPeer fetch failed for {identifier}: {e}")
-        return "PubPeer fetch failed"
+    # Retry once after 5 seconds
+    for attempt in range(2):
+        try:
+            resp = requests.get(f"{PUBPEER_API}/{identifier}", timeout=20)
+            if resp.status_code == 404:
+                return "No PubPeer comments"
+            resp.raise_for_status()
+            data = resp.json()
+            comments = data.get("evaluation_summary", [])
+            if not comments:
+                return "No PubPeer comments"
+            total = len(comments)
+            critical = sum(1 for c in comments if any(w in c.get("comment", "").lower() for w in ["retract", "fabricat", "manipul", "fals", "inconsist", "concern", "error"]))
+            return f"{total} comments ({critical} critical)"
+        except Exception as e:
+            logger.warning(f"PubPeer attempt {attempt+1} failed for {identifier}: {e}")
+            if attempt == 0:
+                time.sleep(5)
+            else:
+                return "PubPeer unavailable"
+    return "PubPeer unavailable"
 
 # ----------------------------------------------------------------------
 # HELPERS: Reddit
@@ -331,7 +412,7 @@ def init_reddit():
         user_agent=REDDIT_USER_AGENT,
     )
 
-def fetch_reddit_posts(subreddit_name, limit=50):
+def fetch_reddit_posts(subreddit_name, limit=20):
     reddit = init_reddit()
     sub = reddit.subreddit(subreddit_name)
     posts = []
@@ -342,9 +423,10 @@ def fetch_reddit_posts(subreddit_name, limit=50):
             continue
         if post.score < 0:
             continue
-        if post.num_comments < MIN_COMMENTS:
+        if post.num_comments < MIN_REDDIT_COMMENTS:
             continue
         posts.append({
+            "id": post.id,
             "title": post.title,
             "url": post.url,
             "score": post.score,
@@ -378,64 +460,95 @@ def fetch_comments(post_url):
         })
     return result
 
+def get_reddit_cache_key(subreddit, post_id):
+    return f"reddit_{subreddit}_{post_id}"
+
 # ----------------------------------------------------------------------
 # DEEPSEEK
 # ----------------------------------------------------------------------
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-def deepseek_summarize(candidates):
-    if not candidates:
+def deepseek_summarize(candidates, reddit_posts):
+    if not candidates and not reddit_posts:
         return ["No candidates found today."]
 
+    # Build candidate list for papers/trials
+    paper_text = ""
+    for i, item in enumerate(candidates, 1):
+        source = item.get("source", "Unknown")
+        search_term = item.get("search_term", "unknown")
+        doi = item.get("doi")
+        nct_id = item.get("nct_id")
+        identifier = doi or nct_id or "N/A"
+        title = item.get("title", "No title")
+        abstract = item.get("abstract", "")[:CAPS["abstract"]]
+        journal = item.get("journal", "")
+        authors = item.get("authors", [])
+        lab = authors[-1] if authors else "unknown lab"
+        pubpeer_note = item.get("pubpeer_note", "No PubPeer data")
+        paper_text += f"{i}. Source: {source} | Search term: \"{search_term}\" | ID: {identifier} | Journal: {journal} | Lab: {lab} | Title: {title} | Abstract: {abstract} | PubPeer: {pubpeer_note}\n"
+
+    # Build reddit text
+    reddit_text = ""
+    for i, post in enumerate(reddit_posts, 1):
+        sub = post.get("subreddit", "unknown")
+        title = post.get("title", "No title")
+        selftext = post.get("selftext", "")[:CAPS["selftext"]]
+        comments = post.get("comments", [])
+        comment_lines = []
+        for c in comments:
+            comment_lines.append(f"Comment (score {c['score']}): {c['comment']}")
+            if c['reply']:
+                comment_lines.append(f"  Reply: {c['reply']}")
+        reddit_text += f"{i}. r/{sub}: \"{title}\"\n   Selftext: {selftext}\n   {chr(10).join(comment_lines)}\n"
+
     prompt = f"""
-You are a scientific summariser for gene therapy researchers.
+You are a scientific summariser. Your task is to produce a daily digest.
 
-You have candidates from different sources. Handle them as follows:
+**For papers/trials**: From the list below, select the **5 most significant** papers/trials. Significance means novelty, impact, negative results that challenge dogma, or high relevance to gene therapy, editing, delivery, engineering, immunology, bioinformatics, computational biology, DNA repair, epigenetics, or manufacturing.
 
-1. **PubMed, bioRxiv, ClinicalTrials.gov**: You received the 3 oldest items per source. From each source, select the **1 most significant** item (so you'll output one from PubMed, one from bioRxiv, one from ClinicalTrials.gov). Prioritise those where gene editing, delivery, therapy, or engineering is the core focus. For clinical trials, include key details like study size, phase, status, and the intervention being tested.
-2. **Named authors**: These are always from David Liu or Ciaran Lee. Summarise each one directly – no selection needed.
-3. **Reddit (top subs)**: You will receive up to 3 posts per subreddit (r/labrats, r/bioinformatics, r/machinelearning, r/GeneEditing). From each subreddit, select **1 post** that provides the most **practically useful information** — e.g., lab tips, troubleshooting, protocol advice, tool recommendations, career insights. **Skip** rants, memes, news, or venting posts even if highly upvoted.
-4. **Reddit (filtered subs)**: You will receive up to 3 posts per subreddit (r/clinicaltrials, r/biotech). From each subreddit, select **1 post** that provides the most **practically useful and relevant information** to your keywords. Also skip rants, memes, or news. If none are relevant, output nothing for that subreddit.
+**For Reddit posts**: Summarise each of the provided Reddit posts using the comments and replies to capture the consensus, useful tips, or points of contention. Do not select – summarise all.
 
-Output format (use these exact sections):
+**Output format** (use exactly these sections):
 
 🧬 **Daily Digest – [Date]**
 
-**PubMed (most significant):**
-1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
+**Papers / Trials (most significant):**
+1. [Source via "search_term"] ID: ... – summary (2-4 sentences explaining what was done, what was found, and the method/mechanism if available) – Lab name. PubPeer: note.
+2. ...
 
-**bioRxiv (most significant):**
-1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
+**Reddit (useful posts):**
+1. r/subreddit: "Title" – synthesised summary of post + comments/replies.
+2. ...
 
-**Clinical Trials (most significant):**
-1. [ClinicalTrials.gov] NCT123456: "title" – summary including status, phase, enrollment... (PubPeer: note)
+Important:
+- Use the provided ID (DOI or NCT) as the primary identifier; do not include the title separately.
+- For ClinicalTrials.gov, mention status, phase, enrollment if available.
+- If a trial has a linked paper, note the journal and include the paper's PubPeer separately.
+- For named authors, the search term will be the author's name in quotes.
+- Do not hallucinate details; only use what is in the abstract or comments.
+- The summaries should be explanatory, around 2-4 sentences per paper/trial, and 2-3 sentences per Reddit post.
 
-**Named authors:**
-1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
+List of paper/trial candidates:
+{paper_text}
 
-**Reddit (top subs – practical advice):**
-1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
-
-**Reddit (filtered subs – relevant & practical):**
-1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
-
-Candidates:
-{chr(10).join([f"- {i.get('source_type')}: {i.get('title')} | Date: {i.get('date')} | {i.get('abstract', i.get('selftext', ''))[:CAPS['abstract']]} | PubPeer: {i.get('pubpeer_note', 'N/A')}" for i in candidates])}
+Reddit posts to summarise:
+{reddit_text}
 """
 
     payload = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 1500,
+        "max_tokens": 2500,
     }
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
     try:
-        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip().split("\n")
@@ -462,19 +575,32 @@ def send_telegram(message):
 # ----------------------------------------------------------------------
 
 def main():
-    if not run_if_not_peak():
+    # 1. Check if already run today or peak hours
+    if already_run_today():
+        logger.info("Already run today, exiting.")
+        return
+    if is_peak_hours():
+        logger.info("Peak hours, exiting (will retry next hour).")
         return
 
     logger.info("Starting daily digest...")
     sent = load_cache()
     now = datetime.now()
+    all_candidates = []
+    selected_reddit_posts = []
 
     # ------------------------------------------------------------------
-    # 1. PubMed (search terms) – take 3 oldest
+    # A. FETCH PAPERS / TRIALS
     # ------------------------------------------------------------------
+
     pubmed_candidates = []
-    for kw in KEYWORDS:
-        pmids = pubmed_search(kw, retmax=50)
+    biorxiv_candidates = []
+    ct_candidates = []
+    author_candidates = []
+
+    # --- PubMed ---
+    for term in KEYWORDS:
+        pmids = fetch_with_retry(pubmed_search, term, retmax=200)
         if pmids:
             records = pubmed_fetch(pmids)
             for rec in records:
@@ -484,26 +610,16 @@ def main():
                     if pub_date:
                         age_days = (now - pub_date).days
                         if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                            data["source"] = "PubMed"
+                            data["search_term"] = term
                             data["pubpeer_note"] = get_pubpeer_note(data["doi"])
-                            data["source_type"] = "PubMed_Search"
                             pubmed_candidates.append(data)
+    time.sleep(1)  # delay between sources
 
-    seen = set()
-    unique_pubmed = []
-    for item in sorted(pubmed_candidates, key=lambda x: parse_pubmed_date(x["date"]) or now):
-        if item["doi"] not in seen:
-            seen.add(item["doi"])
-            unique_pubmed.append(item)
-    pubmed_selected = unique_pubmed[:3]
-    logger.info(f"PubMed: {len(pubmed_selected)} oldest candidates selected.")
-
-    # ------------------------------------------------------------------
-    # 2. bioRxiv (search terms) – take 3 oldest
-    # ------------------------------------------------------------------
-    biorxiv_candidates = []
-    for kw in KEYWORDS:
-        query = kw.replace('"', '').replace(' AND ', '+').replace(' ', '+')
-        papers = biorxiv_search(query, limit=50)
+    # --- bioRxiv ---
+    for term in KEYWORDS:
+        query = term.replace('"', '').replace(' AND ', '+').replace(' ', '+')
+        papers = fetch_with_retry(biorxiv_search, query, limit=100)
         for p in papers:
             data = parse_biorxiv_paper(p)
             if data["doi"] and data["doi"] not in sent:
@@ -513,26 +629,15 @@ def main():
                     continue
                 age_days = (now - pub_date).days
                 if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                    data["source"] = "bioRxiv"
+                    data["search_term"] = term
                     data["pubpeer_note"] = get_pubpeer_note(data["doi"])
-                    data["source_type"] = "bioRxiv_Search"
                     biorxiv_candidates.append(data)
+    time.sleep(1)  # delay between sources
 
-    seen = set()
-    unique_biorxiv = []
-    for item in sorted(biorxiv_candidates, key=lambda x: x.get("date", "2000-01-01")):
-        if item["doi"] not in seen:
-            seen.add(item["doi"])
-            unique_biorxiv.append(item)
-    biorxiv_selected = unique_biorxiv[:3]
-    logger.info(f"bioRxiv: {len(biorxiv_selected)} oldest candidates selected.")
-
-    # ------------------------------------------------------------------
-    # 3. ClinicalTrials.gov (search terms) – take 3 oldest
-    # ------------------------------------------------------------------
-    clinicaltrials_candidates = []
-    for kw in KEYWORDS:
-        query = kw.replace('"', '').replace('*', '').replace(' AND ', ' ').strip()
-        studies = clinicaltrials_search(query, limit=50)
+    # --- ClinicalTrials.gov ---
+    for term in CT_KEYWORDS:
+        studies = fetch_with_retry(clinicaltrials_search, term, limit=100)
         for study in studies:
             data = parse_clinicaltrial(study)
             if data["nct_id"] and data["nct_id"] not in sent:
@@ -540,28 +645,34 @@ def main():
                 if pub_date:
                     age_days = (now - pub_date).days
                     if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
-                        data["pubpeer_note"] = get_pubpeer_note(data["nct_id"])
-                        data["source_type"] = "ClinicalTrials"
-                        clinicaltrials_candidates.append(data)
+                        # Try to get linked paper
+                        linked_paper = get_paper_from_clinicaltrial_refs(data["linked_refs"]) if data["linked_refs"] else None
+                        if linked_paper:
+                            data["abstract"] = linked_paper.get("abstract", data["abstract"])[:CAPS["abstract"]]
+                            data["journal"] = linked_paper.get("journal", "ClinicalTrials.gov record")
+                            # Also fetch PubPeer for linked paper
+                            linked_doi = None
+                            for ref in data["linked_refs"]:
+                                if ref["type"] == "doi":
+                                    linked_doi = ref["id"]
+                                    break
+                            if linked_doi:
+                                data["paper_pubpeer"] = get_pubpeer_note(linked_doi)
+                            else:
+                                data["paper_pubpeer"] = None
+                        else:
+                            data["journal"] = "ClinicalTrials.gov record"
+                        data["source"] = "ClinicalTrials.gov"
+                        data["search_term"] = term
+                        data["pubpeer_note"] = get_pubpeer_note(data["nct_id"])  # trial note
+                        ct_candidates.append(data)
+    time.sleep(1)  # delay between sources
 
-    seen = set()
-    unique_ct = []
-    for item in sorted(clinicaltrials_candidates, key=lambda x: parse_clinicaltrial_date(x["date"]) or now):
-        if item["nct_id"] not in seen:
-            seen.add(item["nct_id"])
-            unique_ct.append(item)
-    clinicaltrials_selected = unique_ct[:3]
-    logger.info(f"ClinicalTrials.gov: {len(clinicaltrials_selected)} oldest candidates selected.")
-
-    # ------------------------------------------------------------------
-    # 4. Named authors – take 1 oldest each
-    # ------------------------------------------------------------------
-    author_selected = []
+    # --- Named authors ---
     for author_rule in AUTHOR_RULES:
-        author_items = []
-        # PubMed
+        # PubMed queries
         for query in author_rule["pubmed_queries"]:
-            pmids = pubmed_search(query, retmax=10)
+            pmids = fetch_with_retry(pubmed_search, query, retmax=50)
             if pmids:
                 records = pubmed_fetch(pmids)
                 for rec in records:
@@ -571,13 +682,14 @@ def main():
                         if pub_date:
                             age_days = (now - pub_date).days
                             if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                                data["source"] = "PubMed"
+                                data["search_term"] = f'"{author_rule["name"]}"'
                                 data["pubpeer_note"] = get_pubpeer_note(data["doi"])
-                                data["source_type"] = "Named author"
                                 data["author_label"] = author_rule["name"]
-                                author_items.append(data)
+                                author_candidates.append(data)
         # bioRxiv
         query = author_rule["biorxiv_query"].replace('"', '').replace(' ', '+')
-        papers = biorxiv_search(query, limit=10)
+        papers = fetch_with_retry(biorxiv_search, query, limit=50)
         for p in papers:
             data = parse_biorxiv_paper(p)
             if data["doi"] and data["doi"] not in sent:
@@ -587,78 +699,106 @@ def main():
                     continue
                 age_days = (now - pub_date).days
                 if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
+                    data["source"] = "bioRxiv"
+                    data["search_term"] = f'"{author_rule["name"]}"'
                     data["pubpeer_note"] = get_pubpeer_note(data["doi"])
-                    data["source_type"] = "Named author"
                     data["author_label"] = author_rule["name"]
-                    author_items.append(data)
-        if author_items:
-            oldest = sorted(author_items, key=lambda x: parse_pubmed_date(x.get("date")) or now)[0]
-            author_selected.append(oldest)
+                    author_candidates.append(data)
 
-    logger.info(f"Named authors: {len(author_selected)} oldest selected.")
+    # --- Combine non-author candidates and dedupe ---
+    all_raw = pubmed_candidates + biorxiv_candidates + ct_candidates
+    groups = {}
+    for cand in all_raw:
+        key = (cand.get("source"), cand.get("search_term"))
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(cand)
+
+    selected = []
+    for (source, term), items in groups.items():
+        # Sort by date (oldest first)
+        sorted_items = sorted(items, key=lambda x: parse_pubmed_date(x.get("date")) or parse_clinicaltrial_date(x.get("date")) or now)
+        if sorted_items:
+            # Check if any have DOI/NCT ID not in sent (we already filtered, but just in case)
+            for item in sorted_items:
+                key_id = item.get("doi") or item.get("nct_id")
+                if key_id and key_id not in sent:
+                    selected.append(item)
+                    break
+
+    # --- Named authors: pick 1 oldest per author ---
+    author_final = []
+    # Group by author_label
+    author_groups = {}
+    for item in author_candidates:
+        label = item.get("author_label")
+        if label:
+            author_groups.setdefault(label, []).append(item)
+    for label, items in author_groups.items():
+        # Sort by date (oldest first)
+        sorted_auth = sorted(items, key=lambda x: parse_pubmed_date(x.get("date")) or now)
+        if sorted_auth:
+            author_final.append(sorted_auth[0])
+
+    # --- Final unique set (dedupe by ID) ---
+    seen_ids = set()
+    unique_selected = []
+    for item in selected + author_final:
+        key_id = item.get("doi") or item.get("nct_id")
+        if key_id and key_id not in seen_ids:
+            seen_ids.add(key_id)
+            unique_selected.append(item)
+
+    all_candidates = unique_selected
+    logger.info(f"Selected {len(all_candidates)} unique paper/trial candidates.")
 
     # ------------------------------------------------------------------
-    # 5. Reddit (top subs) – fetch top 3, DeepSeek selects 1 useful
+    # B. REDDIT (simplified)
     # ------------------------------------------------------------------
-    top_reddit = []
-    for sub in TOP_SUBREDDITS:
-        posts = fetch_reddit_posts(sub)
-        if posts:
-            top_three = sorted(posts, key=lambda x: x["score"], reverse=True)[:3]
-            for post in top_three:
-                post["comments"] = fetch_comments(post["url"])
-                post["source"] = "Reddit (top)"
-                post["source_type"] = "Top Reddit"
-                top_reddit.append(post)
+
+    reddit_candidates = []
+    for sub in SUBREDDITS:
+        posts = fetch_reddit_posts(sub, limit=20)  # fetch top 20
+        # filter cache
+        fresh = [p for p in posts if get_reddit_cache_key(sub, p["id"]) not in sent]
+        # take top 10 (or all if fewer)
+        top_ten = sorted(fresh, key=lambda x: x["score"], reverse=True)[:10]
+        if len(top_ten) >= 2:
+            top1_score = top_ten[0]["score"]
+            avg_rest = sum(p["score"] for p in top_ten[1:]) / (len(top_ten) - 1)
+            ratio = top1_score / avg_rest if avg_rest > 0 else top1_score
+            reddit_candidates.append({
+                "subreddit": sub,
+                "posts": top_ten,
+                "ratio": ratio,
+                "top_post": top_ten[0],
+            })
+
+    # Select top 5 subreddits by ratio
+    reddit_candidates.sort(key=lambda x: x["ratio"], reverse=True)
+    top_subs = reddit_candidates[:5]
+
+    # For each, fetch comments for the top post
+    selected_reddit_posts = []
+    for entry in top_subs:
+        post = entry["top_post"]
+        post["comments"] = fetch_comments(post["url"])
+        selected_reddit_posts.append(post)
+
+    logger.info(f"Selected {len(selected_reddit_posts)} Reddit posts.")
 
     # ------------------------------------------------------------------
-    # 6. Reddit (filtered subs) – fetch top 3, DeepSeek selects 1 useful
+    # C. DEEPSEEK
     # ------------------------------------------------------------------
-    filtered_reddit = []
-    for sub in FILTERED_SUBREDDITS:
-        posts = fetch_reddit_posts(sub)
-        if posts:
-            top_three = sorted(posts, key=lambda x: x["score"], reverse=True)[:3]
-            for post in top_three:
-                post["comments"] = fetch_comments(post["url"])
-                post["source"] = "Reddit (filtered)"
-                post["source_type"] = "Filtered Reddit"
-                filtered_reddit.append(post)
 
-    # ------------------------------------------------------------------
-    # 7. Combine all candidates and global dedupe
-    # ------------------------------------------------------------------
-    all_candidates = (
-        pubmed_selected +
-        biorxiv_selected +
-        clinicaltrials_selected +
-        author_selected +
-        top_reddit +
-        filtered_reddit
-    )
-
-    seen = set()
-    unique_candidates = []
-    for item in all_candidates:
-        key = item.get("doi") or item.get("nct_id") or item.get("url") or item.get("title")
-        if key and key not in seen:
-            seen.add(key)
-            unique_candidates.append(item)
-    all_candidates = unique_candidates
-
-    logger.info(f"Total unique candidates: {len(all_candidates)} (PubMed: {len(pubmed_selected)}, bioRxiv: {len(biorxiv_selected)}, ClinicalTrials: {len(clinicaltrials_selected)}, Authors: {len(author_selected)}, Top Reddit: {len(top_reddit)}, Filtered Reddit: {len(filtered_reddit)})")
-
-    if not all_candidates:
-        send_telegram("⚠️ No new relevant papers, trials, or posts found today.")
+    if not all_candidates and not selected_reddit_posts:
+        send_telegram("⚠️ No new relevant papers, trials, or Reddit posts found today.")
         return
 
-    # ------------------------------------------------------------------
-    # 8. DeepSeek summarisation
-    # ------------------------------------------------------------------
-    summary_lines = deepseek_summarize(all_candidates)
+    summary_lines = deepseek_summarize(all_candidates, selected_reddit_posts)
 
     # ------------------------------------------------------------------
-    # 9. Send to Telegram
+    # D. SEND TELEGRAM
     # ------------------------------------------------------------------
     date_str = now.strftime("%B %d, %Y")
     if summary_lines and "Daily Digest" not in summary_lines[0]:
@@ -667,13 +807,17 @@ def main():
     send_telegram(final_msg)
 
     # ------------------------------------------------------------------
-    # 10. Update cache
+    # E. UPDATE CACHE
     # ------------------------------------------------------------------
     for item in all_candidates:
         key = item.get("doi") or item.get("nct_id")
         if key:
             sent[key] = time.time()
+    for post in selected_reddit_posts:
+        key = get_reddit_cache_key(post["subreddit"], post["id"])
+        sent[key] = time.time()
     save_cache(sent)
+    mark_run_today()
 
     logger.info("Digest sent successfully.")
 
