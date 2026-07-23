@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily Digest – Gene Therapy / Editing / Delivery / Engineering
-Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via Apify);
+Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via Apify REST API);
 selects most significant; summarises with DeepSeek V4 Flash; sends to Telegram.
 """
 
@@ -15,7 +15,6 @@ from datetime import datetime, timedelta
 
 import requests
 from Bio import Entrez, Medline
-from apify_client import ApifyClient
 
 # ----------------------------------------------------------------------
 # CONFIGURATION (environment variables)
@@ -25,7 +24,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
-APIFY_TOKEN = os.environ.get("APIFY_TOKEN")   # <-- new
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")   # <-- your Apify token (secret)
 
 # ----------------------------------------------------------------------
 # SEARCH TERMS
@@ -395,27 +394,50 @@ def get_pubpeer_note(identifier):
     return "PubPeer unavailable"
 
 # ===========================================================================
-# REDDIT SCRAPING (via Apify – no API keys, works from GitHub)
+# REDDIT SCRAPING (via Apify REST API – no SDK, no x402)
 # ===========================================================================
 
-client = ApifyClient(token=APIFY_TOKEN, enable_x402=False)
+def call_apify_actor(input_data, timeout_seconds=60):
+    """
+    Run an Apify actor via REST API and return the dataset items.
+    Uses Bearer token authentication – no x402.
+    """
+    run_url = "https://api.apify.com/v2/acts/apify~reddit-scraper/runs"
+    headers = {
+        "Authorization": f"Bearer {APIFY_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "input": input_data,
+        "waitForFinish": timeout_seconds
+    }
+
+    resp = requests.post(run_url, json=payload, headers=headers, timeout=timeout_seconds + 10)
+    resp.raise_for_status()
+    run_data = resp.json()
+
+    dataset_id = run_data["data"]["defaultDatasetId"]
+
+    dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+    items_resp = requests.get(dataset_url, headers=headers)
+    items_resp.raise_for_status()
+
+    return items_resp.json()
+
 
 def fetch_reddit_posts(subreddit, limit=20):
-    """Fetch top posts from a subreddit using Apify."""
-    actor_input = {
+    """Fetch top posts from a subreddit using Apify REST API."""
+    input_data = {
         "subreddit": subreddit,
         "sort": "top",
         "limit": limit,
-        "time": "week",
+        "time": "week"
     }
-    run = client.actor("apify/reddit-scraper").call(run_input=actor_input)
-    items = []
-    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-        items.append(item)
+    items = call_apify_actor(input_data)
+
     posts = []
     now = datetime.utcnow()
     for p in items:
-        # Apify returns 'created_utc' as int
         created = p.get("created_utc", 0)
         if not created:
             continue
@@ -440,22 +462,19 @@ def fetch_reddit_posts(subreddit, limit=20):
         })
     return posts
 
+
 def fetch_comments(post_url):
-    """Fetch top comments from a post using Apify."""
-    actor_input = {
+    """Fetch top comments from a post using Apify REST API."""
+    input_data = {
         "postUrl": post_url,
         "limit": 10,
     }
     try:
-        run = client.actor("apify/reddit-scraper").call(run_input=actor_input)
+        items = call_apify_actor(input_data)
     except Exception as e:
         logger.warning(f"Apify comments fetch failed for {post_url}: {e}")
         return []
-    items = []
-    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-        items.append(item)
-    # items: each is a comment with 'body', 'score', 'replies' (list)
-    # Sort by score
+
     top_comments = sorted(items, key=lambda c: c.get("score", 0), reverse=True)[:3]
     result = []
     for c in top_comments:
@@ -471,6 +490,7 @@ def fetch_comments(post_url):
             "reply_score": top_reply.get("score", 0),
         })
     return result
+
 
 def get_reddit_cache_key(subreddit, post_id):
     return f"reddit_{subreddit}_{post_id}"
@@ -740,13 +760,11 @@ def main():
 
     logger.info(f"Selected {len(all_candidates)} unique paper/trial candidates.")
 
-    # ------------------- REDDIT (Apify) -------------------
+    # ------------------- REDDIT (Apify REST) -------------------
     reddit_candidates = []
     for sub in SUBREDDITS:
         posts = fetch_reddit_posts(sub, limit=20)
-        # Remove cached posts
         fresh = [p for p in posts if get_reddit_cache_key(sub, p["id"]) not in sent]
-        # Keep top 10 by score
         top_ten = sorted(fresh, key=lambda x: x["score"], reverse=True)[:10]
         if len(top_ten) >= 2:
             top1_score = top_ten[0]["score"]
@@ -765,7 +783,6 @@ def main():
     selected_reddit_posts = []
     for entry in top_subs:
         post = entry["top_post"]
-        # Fetch comments via Apify
         comments = fetch_comments(post["url"])
         post["comments"] = comments
         selected_reddit_posts.append(post)
