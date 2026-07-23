@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily Digest – Gene Therapy / Editing / Delivery / Engineering
-Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via old.reddit.com HTML scraping);
+Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via old.reddit.com HTML with curl_cffi);
 selects most significant; summarises with DeepSeek V4 Flash; sends to Telegram.
 """
 
@@ -17,6 +17,7 @@ from urllib.parse import urlparse, parse_qs
 import requests
 from bs4 import BeautifulSoup
 from Bio import Entrez, Medline
+from curl_cffi import requests as cffi_requests   # <-- new import
 
 # ----------------------------------------------------------------------
 # CONFIGURATION (environment variables)
@@ -395,14 +396,14 @@ def get_pubpeer_note(identifier):
     return "PubPeer unavailable"
 
 # ===========================================================================
-# REDDIT SCRAPING (old.reddit.com HTML) – no API keys, no login
+# REDDIT SCRAPING (old.reddit.com HTML) – using curl_cffi to avoid 403
 # ===========================================================================
 
-USER_AGENT = "Mozilla/5.0 (compatible; DailyDigest/1.0; +https://github.com/yourrepo)"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def _get_soup(url):
-    headers = {"User-Agent": USER_AGENT}
-    resp = requests.get(url, headers=headers, timeout=30)
+    """Fetch HTML with curl_cffi impersonating Chrome."""
+    resp = cffi_requests.get(url, impersonate="chrome", timeout=30)
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
@@ -412,9 +413,7 @@ def fetch_reddit_posts(subreddit, limit=20):
     soup = _get_soup(url)
     posts = []
     now = datetime.utcnow()
-    # Each post is a div with class 'thing'
     for thing in soup.find_all("div", class_="thing"):
-        # Extract data attributes
         fullname = thing.get("data-fullname", "")
         if not fullname:
             continue
@@ -438,16 +437,9 @@ def fetch_reddit_posts(subreddit, limit=20):
             created_utc = int(created_utc) if created_utc else 0
         except:
             created_utc = 0
-        # Title
         title_tag = thing.find("a", class_="title")
         title = title_tag.text.strip() if title_tag else ""
 
-        # Selftext – may be in an expando div, but often not in listing.
-        # We'll fetch it from the comments page later if needed.
-        # For now, we store an empty selftext; we'll populate when fetching comments.
-        selftext = ""
-
-        # Filter by age
         if created_utc:
             post_age_days = (now - datetime.utcfromtimestamp(created_utc)).days
             if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
@@ -465,85 +457,67 @@ def fetch_reddit_posts(subreddit, limit=20):
             "num_comments": comments_count,
             "subreddit": subreddit,
             "created_utc": created_utc,
-            "selftext": selftext,  # will be filled later
+            "selftext": "",   # will be filled later
         })
     return posts
 
 def fetch_comments(post_url):
-    """Fetch top comments and replies from a post's HTML page."""
+    """Fetch selftext and top comments/replies from a post's page."""
     soup = _get_soup(post_url)
-    # Get selftext from the post body
+    # Selftext
     selftext = ""
     content_div = soup.find("div", class_="usertext-body")
     if content_div:
         selftext = content_div.get_text(strip=True)
 
-    # Extract comments – they are nested under div.thing with class 'comment'
-    # We need to parse the tree. We'll use a recursive approach.
-    # Comments are inside a div with id 'siteTable' or similar.
-    comments = []
-    # Find all top-level comment divs with class 'comment'
-    # They are direct children of the comment area.
+    # Parse comments
     comment_area = soup.find("div", class_="commentarea")
     if not comment_area:
-        return []
+        return selftext, []
 
-    # We'll iterate through the children of comment_area that are div.thing.comment
-    # and are not replies (replies are inside a div with class 'child').
-    # So we'll recursively parse.
-    def parse_comment(comment_div, depth=0):
-        # comment_div is a div.thing.comment
-        # Extract data
+    def parse_comment(comment_div):
         fullname = comment_div.get("data-fullname", "")
         if not fullname:
             return None
-        # Get score (may be hidden, use data-score)
         score = comment_div.get("data-score")
         try:
             score = int(score) if score else 0
         except:
             score = 0
-        # Body
         body_div = comment_div.find("div", class_="usertext-body")
         body = body_div.get_text(strip=True) if body_div else ""
-        # Replies are inside a div with class 'child' (or 'nested')
         replies = []
         child_div = comment_div.find("div", class_="child")
         if child_div:
             for reply_div in child_div.find_all("div", class_="thing", recursive=False):
-                # Check if it's a comment (has data-fullname)
                 if reply_div.get("data-fullname"):
-                    reply_obj = parse_comment(reply_div, depth+1)
+                    reply_obj = parse_comment(reply_div)
                     if reply_obj:
                         replies.append(reply_obj)
         return {
             "body": body[:CAPS["comment"]],
             "score": score,
-            "replies": replies[:1]  # we only need top 1 reply, but we'll sort by score later
+            "replies": replies
         }
 
-    # Find top-level comment divs (direct children of comment_area)
     top_level = []
     for child in comment_area.children:
         if child.name == "div" and "thing" in child.get("class", []) and "comment" in child.get("class", []):
             top_level.append(child)
-    # Parse them
+
     parsed_comments = []
     for div in top_level:
         parsed = parse_comment(div)
         if parsed:
             parsed_comments.append(parsed)
 
-    # Sort top-level comments by score (descending)
     parsed_comments.sort(key=lambda x: x["score"], reverse=True)
-    # Take top 3
     top_comments = parsed_comments[:3]
-    # For each, sort replies by score and take top 1
+
     result = []
     for c in top_comments:
         replies = c.get("replies", [])
         if replies:
-            # Sort replies by score (descending)
             replies.sort(key=lambda r: r["score"], reverse=True)
             top_reply = replies[0]
         else:
@@ -554,9 +528,8 @@ def fetch_comments(post_url):
             "reply": top_reply["body"][:CAPS["reply"]],
             "reply_score": top_reply["score"],
         })
-    return selftext, result  # return selftext and comments
+    return selftext, result
 
-# Update get_reddit_cache_key as before
 def get_reddit_cache_key(subreddit, post_id):
     return f"reddit_{subreddit}_{post_id}"
 
@@ -829,20 +802,9 @@ def main():
     reddit_candidates = []
     for sub in SUBREDDITS:
         posts = fetch_reddit_posts(sub, limit=20)
-        # Remove cached posts
         fresh = [p for p in posts if get_reddit_cache_key(sub, p["id"]) not in sent]
-        # Keep top 10 by score
         top_ten = sorted(fresh, key=lambda x: x["score"], reverse=True)[:10]
         if len(top_ten) >= 2:
-            # For each, fetch selftext and comments (this adds time, but we only need top posts)
-            # We'll fetch comments for the top post later, but we need selftext for all top_ten?
-            # We can fetch selftext only for the top 1? Actually we use selftext in the summary.
-            # We'll fetch selftext for each top_ten post by fetching the comments page and extracting selftext.
-            # This is heavy; we can skip selftext and only get it for the final selected posts.
-            # But we need selftext for the ratio calculation? No, ratio is based on scores.
-            # For the final top 5, we'll fetch selftext and comments when we select them.
-            # So we don't need selftext now.
-            # We'll store the posts without selftext, then later fetch selftext for the top post of each sub.
             top1_score = top_ten[0]["score"]
             avg_rest = sum(p["score"] for p in top_ten[1:]) / (len(top_ten) - 1)
             ratio = top1_score / avg_rest if avg_rest > 0 else top1_score
@@ -859,7 +821,6 @@ def main():
     selected_reddit_posts = []
     for entry in top_subs:
         post = entry["top_post"]
-        # Fetch selftext and comments for this post
         selftext, comments = fetch_comments(post["url"])
         post["selftext"] = selftext[:CAPS["selftext"]]
         post["comments"] = comments
