@@ -99,7 +99,7 @@ SUBREDDITS = [
     "statistics",
 ]
 
-MIN_REDDIT_COMMENTS = 15
+MIN_REDDIT_COMMENTS = 1   # was 15, now effectively no filter (top posts have ≥1)
 REDDIT_WINDOW_START = 1   # 1 day old minimum
 REDDIT_WINDOW_END = 8     # 8 days old maximum
 
@@ -379,7 +379,6 @@ PUBPEER_API = "https://pubpeer.com/api/v2/publications"
 def get_pubpeer_note(identifier):
     if not identifier:
         return "No PubPeer data"
-    # Retry once after 5 seconds
     for attempt in range(2):
         try:
             resp = requests.get(f"{PUBPEER_API}/{identifier}", timeout=20)
@@ -503,39 +502,38 @@ def deepseek_summarize(candidates, reddit_posts):
                 comment_lines.append(f"  Reply: {c['reply']}")
         reddit_text += f"{i}. r/{sub}: \"{title}\"\n   Selftext: {selftext}\n   {chr(10).join(comment_lines)}\n"
 
+    # ─── EXACT PROMPT PROVIDED BY USER ───
     prompt = f"""
 You are a scientific summariser. Your task is to produce a daily digest.
 
-**For papers/trials**: From the list below, select the **5 most significant** papers/trials. Significance means novelty, impact, negative results that challenge dogma, or high relevance to gene therapy, editing, delivery, engineering, immunology, bioinformatics, computational biology, DNA repair, epigenetics, or manufacturing.
+**For papers/trials**: From the list below, select the **5 most significant** papers/preprints/trials. Summarise with available information to state key information and explain what was done/is being done, how it was done/is being done, and what was found/hoping to be found. 
 
-**For Reddit posts**: Summarise each of the provided Reddit posts using the comments and replies to capture the consensus, useful tips, or points of contention. Do not select – summarise all.
+**For Reddit posts**: Summarise each of the provided Reddit posts using the comments and replies to capture the consensus.
 
-**Output format** (use exactly these sections):
+**Rules**:
+- Use the context and your trained knowledge to understand and summarise, but if you are unsure about something or there's ambiguous, include that thing or ambiguity in the summary for the reader to understand by themselves. You are not to hallucinate information not present nor guess things you're unsure of.
+- Paper summaries: 4–6 sentences.
+- Reddit summaries: 2–3 sentences.
 
-🧬 **Daily Digest – [Date]**
+**Output format** (use these sections exactly):
+
+🧬 **[Date]**
 
 **Papers / Trials (most significant):**
-1. [Source via "search_term"] ID: ... – summary (2-4 sentences explaining what was done, what was found, and the method/mechanism if available) – Lab name. PubPeer: note.
+1. [Source via "search_term" or name of author search for] ID: ... – summary – Lab name. PubPeer: note or state lack of comments.
 2. ...
 
 **Reddit (useful posts):**
-1. r/subreddit: "Title" – synthesised summary of post + comments/replies.
+1. r/subreddit: "Title" – summarised post + comments/replies.
 2. ...
 
-Important:
-- Use the provided ID (DOI or NCT) as the primary identifier; do not include the title separately.
-- For ClinicalTrials.gov, mention status, phase, enrollment if available.
-- If a trial has a linked paper, note the journal and include the paper's PubPeer separately.
-- For named authors, the search term will be the author's name in quotes.
-- Do not hallucinate details; only use what is in the abstract or comments.
-- The summaries should be explanatory, around 2-4 sentences per paper/trial, and 2-3 sentences per Reddit post.
-
-List of paper/trial candidates:
+Candidates:
 {paper_text}
 
-Reddit posts to summarise:
+Reddit posts:
 {reddit_text}
 """
+    # ─── END USER PROMPT ───
 
     payload = {
         "model": "deepseek-chat",
@@ -633,7 +631,7 @@ def main():
                     data["search_term"] = term
                     data["pubpeer_note"] = get_pubpeer_note(data["doi"])
                     biorxiv_candidates.append(data)
-    time.sleep(1)  # delay between sources
+    time.sleep(1)
 
     # --- ClinicalTrials.gov ---
     for term in CT_KEYWORDS:
@@ -645,12 +643,10 @@ def main():
                 if pub_date:
                     age_days = (now - pub_date).days
                     if PAPER_WINDOW_START_DAYS >= age_days >= PAPER_WINDOW_END_DAYS:
-                        # Try to get linked paper
                         linked_paper = get_paper_from_clinicaltrial_refs(data["linked_refs"]) if data["linked_refs"] else None
                         if linked_paper:
                             data["abstract"] = linked_paper.get("abstract", data["abstract"])[:CAPS["abstract"]]
                             data["journal"] = linked_paper.get("journal", "ClinicalTrials.gov record")
-                            # Also fetch PubPeer for linked paper
                             linked_doi = None
                             for ref in data["linked_refs"]:
                                 if ref["type"] == "doi":
@@ -664,13 +660,12 @@ def main():
                             data["journal"] = "ClinicalTrials.gov record"
                         data["source"] = "ClinicalTrials.gov"
                         data["search_term"] = term
-                        data["pubpeer_note"] = get_pubpeer_note(data["nct_id"])  # trial note
+                        data["pubpeer_note"] = get_pubpeer_note(data["nct_id"])
                         ct_candidates.append(data)
-    time.sleep(1)  # delay between sources
+    time.sleep(1)
 
     # --- Named authors ---
     for author_rule in AUTHOR_RULES:
-        # PubMed queries
         for query in author_rule["pubmed_queries"]:
             pmids = fetch_with_retry(pubmed_search, query, retmax=50)
             if pmids:
@@ -687,7 +682,6 @@ def main():
                                 data["pubpeer_note"] = get_pubpeer_note(data["doi"])
                                 data["author_label"] = author_rule["name"]
                                 author_candidates.append(data)
-        # bioRxiv
         query = author_rule["biorxiv_query"].replace('"', '').replace(' ', '+')
         papers = fetch_with_retry(biorxiv_search, query, limit=50)
         for p in papers:
@@ -705,7 +699,7 @@ def main():
                     data["author_label"] = author_rule["name"]
                     author_candidates.append(data)
 
-    # --- Combine non-author candidates and dedupe ---
+    # Combine non‑author candidates and dedupe by (source, term) → pick oldest
     all_raw = pubmed_candidates + biorxiv_candidates + ct_candidates
     groups = {}
     for cand in all_raw:
@@ -716,31 +710,27 @@ def main():
 
     selected = []
     for (source, term), items in groups.items():
-        # Sort by date (oldest first)
         sorted_items = sorted(items, key=lambda x: parse_pubmed_date(x.get("date")) or parse_clinicaltrial_date(x.get("date")) or now)
         if sorted_items:
-            # Check if any have DOI/NCT ID not in sent (we already filtered, but just in case)
             for item in sorted_items:
                 key_id = item.get("doi") or item.get("nct_id")
                 if key_id and key_id not in sent:
                     selected.append(item)
                     break
 
-    # --- Named authors: pick 1 oldest per author ---
+    # Named authors: 1 oldest per author
     author_final = []
-    # Group by author_label
     author_groups = {}
     for item in author_candidates:
         label = item.get("author_label")
         if label:
             author_groups.setdefault(label, []).append(item)
     for label, items in author_groups.items():
-        # Sort by date (oldest first)
         sorted_auth = sorted(items, key=lambda x: parse_pubmed_date(x.get("date")) or now)
         if sorted_auth:
             author_final.append(sorted_auth[0])
 
-    # --- Final unique set (dedupe by ID) ---
+    # Final unique set by ID
     seen_ids = set()
     unique_selected = []
     for item in selected + author_final:
@@ -753,15 +743,13 @@ def main():
     logger.info(f"Selected {len(all_candidates)} unique paper/trial candidates.")
 
     # ------------------------------------------------------------------
-    # B. REDDIT (simplified)
+    # B. REDDIT
     # ------------------------------------------------------------------
 
     reddit_candidates = []
     for sub in SUBREDDITS:
-        posts = fetch_reddit_posts(sub, limit=20)  # fetch top 20
-        # filter cache
+        posts = fetch_reddit_posts(sub, limit=20)
         fresh = [p for p in posts if get_reddit_cache_key(sub, p["id"]) not in sent]
-        # take top 10 (or all if fewer)
         top_ten = sorted(fresh, key=lambda x: x["score"], reverse=True)[:10]
         if len(top_ten) >= 2:
             top1_score = top_ten[0]["score"]
@@ -774,11 +762,9 @@ def main():
                 "top_post": top_ten[0],
             })
 
-    # Select top 5 subreddits by ratio
     reddit_candidates.sort(key=lambda x: x["ratio"], reverse=True)
     top_subs = reddit_candidates[:5]
 
-    # For each, fetch comments for the top post
     selected_reddit_posts = []
     for entry in top_subs:
         post = entry["top_post"]
@@ -801,8 +787,21 @@ def main():
     # D. SEND TELEGRAM
     # ------------------------------------------------------------------
     date_str = now.strftime("%B %d, %Y")
-    if summary_lines and "Daily Digest" not in summary_lines[0]:
-        summary_lines.insert(0, f"🧬 **Daily Digest – {date_str}**")
+    if summary_lines:
+        # The prompt already includes "🧬 **[Date]**" – we may need to ensure the date is inserted.
+        # We'll look for the first line starting with "🧬" and replace it if needed.
+        # But the prompt instructs to output "🧬 **[Date]**" – we can let DeepSeek fill it.
+        # However, we can also prepend if missing – we'll check.
+        if summary_lines and not any("🧬" in line for line in summary_lines[:3]):
+            summary_lines.insert(0, f"🧬 **{date_str}**")
+        # If there is a line with "🧬 **[Date]**", we can replace it with the actual date.
+        for i, line in enumerate(summary_lines):
+            if "🧬 **[Date]**" in line:
+                summary_lines[i] = f"🧬 **{date_str}**"
+                break
+    else:
+        summary_lines = ["⚠️ DeepSeek summarisation failed."]
+
     final_msg = "\n".join(summary_lines)
     send_telegram(final_msg)
 
