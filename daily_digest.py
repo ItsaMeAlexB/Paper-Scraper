@@ -2,7 +2,7 @@
 """
 Daily Digest – Gene Therapy / Editing / Delivery / Engineering
 Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via reddit-fetch);
-selects most significant; summarises with DeepSeek; sends to Telegram.
+selects most significant; summarises with DeepSeek V4 Flash; sends to Telegram.
 """
 
 import os
@@ -24,7 +24,7 @@ from Bio import Entrez, Medline
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")   # still needed for PubMed
+ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 
 # Reddit credentials are no longer needed – we use reddit-fetch CLI
 
@@ -401,28 +401,20 @@ def get_pubpeer_note(identifier):
 # ----------------------------------------------------------------------
 
 def run_reddit_command(args):
-    """Run reddit-fetch and return parsed JSON, or [] on failure."""
     cmd = ["reddit-fetch"] + args
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             logger.warning(f"reddit-fetch error: {result.stderr}")
             return []
-        # reddit-fetch outputs JSON lines; parse as list
-        lines = result.stdout.strip().split("\n")
-        # Usually each line is a JSON object; combine if needed
-        # In practice, it outputs one JSON array for top, and one JSON array for comments.
-        # We'll try to parse the whole stdout as JSON; if it fails, parse line by line.
         try:
             data = json.loads(result.stdout)
-            # If data is a dict with 'data' key, unwrap
             if isinstance(data, dict) and "data" in data:
                 return data["data"]
             return data
         except json.JSONDecodeError:
-            # Fallback: each line is a JSON object
             items = []
-            for line in lines:
+            for line in result.stdout.strip().split("\n"):
                 if line.strip():
                     try:
                         items.append(json.loads(line))
@@ -434,17 +426,13 @@ def run_reddit_command(args):
         return []
 
 def fetch_reddit_posts(subreddit, limit=20):
-    """Fetch top posts from a subreddit using reddit-fetch."""
     args = ["top", subreddit, "--limit", str(limit), "--json"]
     data = run_reddit_command(args)
     posts = []
     now = datetime.utcnow()
     for p in data:
-        # reddit-fetch returns dict with keys: id, title, url, score, num_comments, subreddit, created_utc, selftext
-        # Ensure required fields exist
         if not all(k in p for k in ("id", "title", "score", "num_comments", "subreddit", "created_utc", "selftext")):
             continue
-        # Apply age filter
         post_age_days = (now - datetime.utcfromtimestamp(p["created_utc"])).days
         if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
             continue
@@ -465,10 +453,8 @@ def fetch_reddit_posts(subreddit, limit=20):
     return posts
 
 def fetch_comments(post_url):
-    """Fetch top comments and replies for a post using reddit-fetch."""
     args = ["comments", post_url, "--json"]
     data = run_reddit_command(args)
-    # data is expected to be a list of comments, each with 'body', 'score', 'replies' (list)
     top_comments = sorted(data, key=lambda c: c.get("score", 0), reverse=True)[:3]
     result = []
     for c in top_comments:
@@ -476,7 +462,6 @@ def fetch_comments(post_url):
         if len(c.get("body", "")) > CAPS["comment"]:
             logger.info(f"Comment truncated for {post_url}")
         replies = c.get("replies", [])
-        # sort replies by score and take top 1
         top_reply = sorted(replies, key=lambda r: r.get("score", 0), reverse=True)[0] if replies else {}
         reply_text = top_reply.get("body", "")[:CAPS["reply"]]
         if top_reply and len(top_reply.get("body", "")) > CAPS["reply"]:
@@ -493,7 +478,7 @@ def get_reddit_cache_key(subreddit, post_id):
     return f"reddit_{subreddit}_{post_id}"
 
 # ----------------------------------------------------------------------
-# DEEPSEEK
+# DEEPSEEK V4 FLASH
 # ----------------------------------------------------------------------
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -562,7 +547,7 @@ Reddit posts:
 """
 
     payload = {
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",  # cheapest, best balance for science+finance
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": 2500,
@@ -795,13 +780,11 @@ def main():
     # ------------------- TELEGRAM -------------------
     date_str = now.strftime("%B %d, %Y")
     if summary_lines:
-        # Replace placeholder date if present
         for i, line in enumerate(summary_lines):
             if "🧬 **[Date]**" in line:
                 summary_lines[i] = f"🧬 **{date_str}**"
                 break
         else:
-            # If no placeholder found, insert at top
             if not any("🧬" in line for line in summary_lines[:3]):
                 summary_lines.insert(0, f"🧬 **{date_str}**")
     else:
