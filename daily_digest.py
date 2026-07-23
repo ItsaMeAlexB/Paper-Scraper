@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily Digest – Gene Therapy / Editing / Delivery / Engineering
-Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via old.reddit.com HTML with curl_cffi);
+Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via Apify);
 selects most significant; summarises with DeepSeek V4 Flash; sends to Telegram.
 """
 
@@ -12,12 +12,10 @@ import time
 import json
 import logging
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs
 
 import requests
-from bs4 import BeautifulSoup
 from Bio import Entrez, Medline
-from curl_cffi import requests as cffi_requests   # <-- new import
+from apify_client import ApifyClient
 
 # ----------------------------------------------------------------------
 # CONFIGURATION (environment variables)
@@ -27,6 +25,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
+APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN")   # <-- new
 
 # ----------------------------------------------------------------------
 # SEARCH TERMS
@@ -81,7 +80,7 @@ AUTHOR_RULES = [
 ]
 
 # ----------------------------------------------------------------------
-# REDDIT SUBREDDITS (scraped with old.reddit.com)
+# REDDIT SUBREDDITS
 # ----------------------------------------------------------------------
 
 SUBREDDITS = [
@@ -396,139 +395,82 @@ def get_pubpeer_note(identifier):
     return "PubPeer unavailable"
 
 # ===========================================================================
-# REDDIT SCRAPING (old.reddit.com HTML) – using curl_cffi to avoid 403
+# REDDIT SCRAPING (via Apify – no API keys, works from GitHub)
 # ===========================================================================
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-def _get_soup(url):
-    """Fetch HTML with curl_cffi impersonating Chrome."""
-    resp = cffi_requests.get(url, impersonate="chrome", timeout=30)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+client = ApifyClient(APIFY_TOKEN)
 
 def fetch_reddit_posts(subreddit, limit=20):
-    """Fetch top posts from a subreddit using old.reddit.com HTML."""
-    url = f"https://old.reddit.com/r/{subreddit}/top/?t=week&limit={limit}"
-    soup = _get_soup(url)
+    """Fetch top posts from a subreddit using Apify."""
+    actor_input = {
+        "subreddit": subreddit,
+        "sort": "top",
+        "limit": limit,
+        "time": "week",
+    }
+    run = client.actor("apify/reddit-scraper").call(run_input=actor_input)
+    items = []
+    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+        items.append(item)
     posts = []
     now = datetime.utcnow()
-    for thing in soup.find_all("div", class_="thing"):
-        fullname = thing.get("data-fullname", "")
-        if not fullname:
+    for p in items:
+        # Apify returns 'created_utc' as int
+        created = p.get("created_utc", 0)
+        if not created:
             continue
-        post_id = fullname.split("_")[-1] if "_" in fullname else fullname
-        score = thing.get("data-score")
-        try:
-            score = int(score) if score else 0
-        except:
-            score = 0
-        comments_count = thing.get("data-comments-count")
-        try:
-            comments_count = int(comments_count) if comments_count else 0
-        except:
-            comments_count = 0
-        permalink = thing.get("data-permalink", "")
-        if not permalink:
+        post_age_days = (now - datetime.utcfromtimestamp(created)).days
+        if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
             continue
-        url_full = f"https://reddit.com{permalink}"
-        created_utc = thing.get("data-timestamp")
-        try:
-            created_utc = int(created_utc) if created_utc else 0
-        except:
-            created_utc = 0
-        title_tag = thing.find("a", class_="title")
-        title = title_tag.text.strip() if title_tag else ""
-
-        if created_utc:
-            post_age_days = (now - datetime.utcfromtimestamp(created_utc)).days
-            if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
-                continue
+        score = p.get("score", 0)
+        num_comments = p.get("num_comments", 0)
         if score < 0:
             continue
-        if comments_count < MIN_REDDIT_COMMENTS:
+        if num_comments < MIN_REDDIT_COMMENTS:
             continue
-
         posts.append({
-            "id": post_id,
-            "title": title,
-            "url": url_full,
+            "id": p.get("id", ""),
+            "title": p.get("title", ""),
+            "url": p.get("url", ""),
             "score": score,
-            "num_comments": comments_count,
+            "num_comments": num_comments,
             "subreddit": subreddit,
-            "created_utc": created_utc,
-            "selftext": "",   # will be filled later
+            "created_utc": created,
+            "selftext": p.get("selftext", "")[:CAPS["selftext"]],
         })
     return posts
 
 def fetch_comments(post_url):
-    """Fetch selftext and top comments/replies from a post's page."""
-    soup = _get_soup(post_url)
-    # Selftext
-    selftext = ""
-    content_div = soup.find("div", class_="usertext-body")
-    if content_div:
-        selftext = content_div.get_text(strip=True)
-
-    # Parse comments
-    comment_area = soup.find("div", class_="commentarea")
-    if not comment_area:
-        return selftext, []
-
-    def parse_comment(comment_div):
-        fullname = comment_div.get("data-fullname", "")
-        if not fullname:
-            return None
-        score = comment_div.get("data-score")
-        try:
-            score = int(score) if score else 0
-        except:
-            score = 0
-        body_div = comment_div.find("div", class_="usertext-body")
-        body = body_div.get_text(strip=True) if body_div else ""
-        replies = []
-        child_div = comment_div.find("div", class_="child")
-        if child_div:
-            for reply_div in child_div.find_all("div", class_="thing", recursive=False):
-                if reply_div.get("data-fullname"):
-                    reply_obj = parse_comment(reply_div)
-                    if reply_obj:
-                        replies.append(reply_obj)
-        return {
-            "body": body[:CAPS["comment"]],
-            "score": score,
-            "replies": replies
-        }
-
-    top_level = []
-    for child in comment_area.children:
-        if child.name == "div" and "thing" in child.get("class", []) and "comment" in child.get("class", []):
-            top_level.append(child)
-
-    parsed_comments = []
-    for div in top_level:
-        parsed = parse_comment(div)
-        if parsed:
-            parsed_comments.append(parsed)
-
-    parsed_comments.sort(key=lambda x: x["score"], reverse=True)
-    top_comments = parsed_comments[:3]
-
+    """Fetch top comments from a post using Apify."""
+    actor_input = {
+        "postUrl": post_url,
+        "limit": 10,
+    }
+    try:
+        run = client.actor("apify/reddit-scraper").call(run_input=actor_input)
+    except Exception as e:
+        logger.warning(f"Apify comments fetch failed for {post_url}: {e}")
+        return []
+    items = []
+    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+        items.append(item)
+    # items: each is a comment with 'body', 'score', 'replies' (list)
+    # Sort by score
+    top_comments = sorted(items, key=lambda c: c.get("score", 0), reverse=True)[:3]
     result = []
     for c in top_comments:
         replies = c.get("replies", [])
         if replies:
-            replies.sort(key=lambda r: r["score"], reverse=True)
-            top_reply = replies[0]
+            top_reply = sorted(replies, key=lambda r: r.get("score", 0), reverse=True)[0]
         else:
             top_reply = {"body": "", "score": 0}
         result.append({
-            "comment": c["body"][:CAPS["comment"]],
-            "score": c["score"],
-            "reply": top_reply["body"][:CAPS["reply"]],
-            "reply_score": top_reply["score"],
+            "comment": c.get("body", "")[:CAPS["comment"]],
+            "score": c.get("score", 0),
+            "reply": top_reply.get("body", "")[:CAPS["reply"]],
+            "reply_score": top_reply.get("score", 0),
         })
-    return selftext, result
+    return result
 
 def get_reddit_cache_key(subreddit, post_id):
     return f"reddit_{subreddit}_{post_id}"
@@ -798,11 +740,13 @@ def main():
 
     logger.info(f"Selected {len(all_candidates)} unique paper/trial candidates.")
 
-    # ------------------- REDDIT -------------------
+    # ------------------- REDDIT (Apify) -------------------
     reddit_candidates = []
     for sub in SUBREDDITS:
         posts = fetch_reddit_posts(sub, limit=20)
+        # Remove cached posts
         fresh = [p for p in posts if get_reddit_cache_key(sub, p["id"]) not in sent]
+        # Keep top 10 by score
         top_ten = sorted(fresh, key=lambda x: x["score"], reverse=True)[:10]
         if len(top_ten) >= 2:
             top1_score = top_ten[0]["score"]
@@ -821,8 +765,8 @@ def main():
     selected_reddit_posts = []
     for entry in top_subs:
         post = entry["top_post"]
-        selftext, comments = fetch_comments(post["url"])
-        post["selftext"] = selftext[:CAPS["selftext"]]
+        # Fetch comments via Apify
+        comments = fetch_comments(post["url"])
         post["comments"] = comments
         selected_reddit_posts.append(post)
 
