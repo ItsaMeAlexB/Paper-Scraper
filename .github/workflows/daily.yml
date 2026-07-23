@@ -20,4 +20,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: python daily_digest.py
