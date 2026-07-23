@@ -401,7 +401,10 @@ def call_apify_actor(input_data, timeout_seconds=60):
     Run an Apify actor via REST API and return the dataset items.
     Uses Bearer token authentication – no x402.
     """
-    run_url = "https://api.apify.com/v2/acts/apify~reddit-scraper/runs"
+    if not APIFY_TOKEN:
+        raise ValueError("APIFY_TOKEN environment variable is not set.")
+
+    run_url = "https://api.apify.com/v2/acts/apify/reddit-scraper/runs"  # correct slash
     headers = {
         "Authorization": f"Bearer {APIFY_TOKEN}",
         "Content-Type": "application/json"
