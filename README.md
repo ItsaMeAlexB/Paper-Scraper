@@ -1,73 +1,126 @@
+Automated daily summary of relevant papers, clinical trials, and Reddit discussions, and their peer review, delivered to Telegram.
+
+---
+
 ## Overview
 
 This script scrapes:
-- **PubMed** (peer-reviewed papers)
+- **PubMed** (peer‑reviewed papers)
 - **bioRxiv** (preprints)
 - **ClinicalTrials.gov** (clinical trials)
-- **Reddit** (`r/labrats`, `r/bioinformatics`, `r/machinelearning`, `r/GeneEditing`, `r/clinicaltrials`, `r/biotech`)
+- **Reddit** (12 subreddits)
 
 It then:
-- Filters for papers/trials **4–5 weeks old** (to allow PubPeer comments to appear)
-- Filters Reddit posts **1–8 days old** (to allow votes/comments to settle)
-- For **PubMed, bioRxiv, and ClinicalTrials.gov**: takes the **3 oldest** items per source and sends them to DeepSeek, which selects **1 most significant** from each.
-- For **named authors** (David Liu, Ciaran Lee): takes the **1 oldest** paper per author and summarises directly.
-- For **Reddit**: fetches the **top 3 highest‑rated** posts from each subreddit (both top and filtered subs), then uses DeepSeek to select **1 post per subreddit** that provides the most **practically useful information** (lab tips, troubleshooting, protocol advice, tool recommendations, career insights) — skipping rants, memes, news, or venting even if highly upvoted. For filtered subs, DeepSeek also evaluates relevance to your keywords before selecting.
-- Checks PubPeer (notes comments, never cancels papers or trials).
-- Delivers a formatted daily digest via **Telegram** with separate sections for PubMed, bioRxiv, ClinicalTrials, named authors, and Reddit.
+- Filters papers/trials **4–5 weeks old** (to allow PubPeer comments to appear).
+- Filters Reddit posts **1–8 days old** (to allow votes/comments to settle).
+- For each search term and source, fetches **exactly one unique** paper/trial (oldest, avoiding cache and duplicates).
+- For Reddit, fetches **top 20** posts per subreddit, deduplicates, keeps **top 10**, computes a normalised engagement ratio, selects the **top 5 subreddits**, and takes the **#1 post** from each.
+- Fetches **top 3 comments + top 1 reply** for each selected Reddit post.
+- Sends all candidates to **DeepSeek API** to pick the **5 most significant papers/trials** and to summarise the **5 Reddit posts**.
+- Delivers a formatted daily digest via **Telegram**.
 
-## Search Keywords (for PubMed, bioRxiv, ClinicalTrials.gov, and relevance evaluation on filtered Reddit)
+---
 
-- `"gene therapy"`
-- `"gene editing"`
-- `"gene delivery"`
-- `"gen* engineering"`
-- `"machine learning" AND biochem*`
-- `"bioinformatics" AND biochem*`
-- `"DNA repair"`
-- `"epigenetic*"`
+## Search Terms
 
-## Always-Include Authors
+### Applied to PubMed & bioRxiv
+
+```
+"gene therapy"
+"gene editing"
+"gene delivery"
+cell* AND immun*
+bioinformatic*
+"computational biolog*"
+"DNA repair"
+epigenetic*
+manufactur*
+discover* OR engineer*
+```
+
+### Applied to ClinicalTrials.gov (subset)
+
+```
+"gene therapy"
+"gene editing"
+"gene delivery"
+cell* AND immun*
+"DNA repair"
+epigenetic*
+```
+
+---
+
+## Always‑Include Authors
 
 - David Liu (ORCID: 0000-0002-9943-7557)
 - Ciaran Lee (ORCID: 0000-0002-0789-9149)
 
-Papers from these authors are always included in the digest (1 oldest each, summarised directly).
+One paper per author (the **oldest** within the 4–5 week window) is always included.
+
+---
+
+## Reddit Subreddits (12 total)
+
+```
+labrats
+bioinformatics
+machinelearning
+GeneEditing
+clinicaltrials
+biotech
+computationalbiology
+immunology
+biochemistry
+molecularbiology
+cellbiology
+statistics
+```
+
+- Minimum comments: **1** (effectively no filter, since top posts already have ≥1 comment).
+- **Top 20** posts fetched per subreddit → dedupe (cache) → keep **top 10** → compute ratio → select **top 5** subreddits → take their **#1** post.
+
+---
 
 ## Character Caps (Safe – Above Normal)
 
 | Item | Cap |
 | :--- | :--- |
-| Abstract | 2000 chars |
+| Abstract (paper/trial) | 2000 chars |
 | Reddit selftext | 3000 chars |
 | Reddit comment | 500 chars |
 | Reddit reply | 300 chars |
 
-If a cap is exceeded, the system logs it but never truncates meaningful content.
+Exceeding caps is logged; no meaningful content is lost.
 
-## Why 4 Weeks for Papers/Trials?
+---
 
-PubPeer comments have a median delay of ~10 days, but can take up to several weeks. A 4–5 week window:
-- Catches most meaningful comments
-- Avoids sending items before community reaction forms
-- Still provides timely enough updates for a researcher
+## Time Windows
 
-## Why 1–8 Days for Reddit?
+| Item | Window |
+| :--- | :--- |
+| Papers / Trials | 4–5 weeks old (28–35 days) |
+| Reddit posts | 1–8 days old |
+| Cache TTL | 5 weeks (35 days) |
 
-Reddit votes and comments stabilise within 24–48 hours. The 1–8 day window:
-- Skips very fresh posts where votes are still hidden
-- Catches posts with established discussion
-- Avoids stale content (>8 days)
+---
 
-## Why Top 3 Then Select 1?
+## Cron & Idempotency
 
-For papers/trials: fetching 3 oldest gives DeepSeek enough options to pick the most significant while ensuring we see the earliest publications.
-For Reddit: fetching top 3 ensures practical tips aren't missed just because they're #2 or #3, while DeepSeek filters out rants/memes/news and selects the most useful post per subreddit.
+- Runs **every hour** via GitHub Actions (`0 * * * *`).
+- At start:
+  - Checks if already run **today** → exit if yes.
+  - Checks **peak hours** (DeepSeek pricing: UTC 01:00–04:00) → exit if yes.
+- If neither, runs the digest and marks today as done.
+- This guarantees a run within the first safe hour after peak.
+
+---
 
 ## Setup
 
-### 1. GitHub Repository
+### 1. Repository Files
 
-Create a new repository and push these files:
+Create a repository with:
 
 ```
 .
@@ -76,75 +129,71 @@ Create a new repository and push these files:
 │       └── daily.yml
 ├── requirements.txt
 ├── daily_digest.py
-└── README.md
+├── README.md
+└── .gitignore
 ```
 
-### 2. Secrets
+### 2. Secrets (GitHub Actions → Settings → Secrets)
 
-Go to your repo → **Settings** → **Secrets and variables** → **Actions** → add these:
-
-| Secret | Where to get it |
+| Secret | Where to get |
 | :--- | :--- |
-| `DEEPSEEK_API_KEY` | platform.deepseek.com → API Keys |
+| `DEEPSEEK_API_KEY` | platform.deepseek.com |
 | `TELEGRAM_BOT_TOKEN` | @BotFather on Telegram |
-| `TELEGRAM_CHAT_ID` | Send a message to your bot, then `https://api.telegram.org/bot<TOKEN>/getUpdates` |
+| `TELEGRAM_CHAT_ID` | After sending a message to your bot, call `https://api.telegram.org/bot<TOKEN>/getUpdates` |
 | `REDDIT_CLIENT_ID` | reddit.com/prefs/apps → create script app |
 | `REDDIT_CLIENT_SECRET` | same page |
-| `REDDIT_USER_AGENT` | e.g., `"DailyDigest/1.0 (by /u/username)"` |
-| `ENTREZ_EMAIL` | your email (NCBI requires it) |
+| `REDDIT_USER_AGENT` | e.g., `"DailyDigest/1.0 (by /u/yourname)"` |
+| `ENTREZ_EMAIL` | your email (required by NCBI) |
 
 ### 3. Run
 
-Push to GitHub. The workflow runs daily at **20:00 UTC** (avoids DeepSeek peak pricing). You can also trigger it manually from the Actions tab.
+Push to GitHub. The workflow will trigger hourly. You can also manually trigger from the Actions tab.
 
-## Cost
-
-- **DeepSeek API**: ~$0.0007 per day with `deepseek-chat` model
-- **Free credit**: $5 for new users → enough for ~10,000 days
-- **GitHub Actions**: Free for public repositories
+---
 
 ## Output Format
 
 ```
-🧬 **Daily Digest – [Date]**
+🧬 **[Date]**
 
-**PubMed (most significant):**
-1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
+**Papers / Trials (most significant):**
+1. [Source via "search_term"] ID: ... – 4-6 sentence summary – Lab name. PubPeer: note.
+2. ...
 
-**bioRxiv (most significant):**
-1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
-
-**Clinical Trials (most significant):**
-1. [ClinicalTrials.gov] NCT123456: "title" – summary including status, phase, enrollment... (PubPeer: note)
-
-**Named authors:**
-1. [source] "title" – 2-3 sentence summary... (PubPeer: note)
-
-**Reddit (top subs – practical advice):**
-1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
-
-**Reddit (filtered subs – relevant & practical):**
-1. [Post] r/subreddit: "title" – 2-3 sentence summary... (Top comment: "quote" [+score])
+**Reddit (useful posts):**
+1. r/subreddit: "Title" – 2-3 sentence summary of post + comments/replies.
+2. ...
 ```
+
+- For papers: ID is DOI; for trials: NCT number.
+- Source is `PubMed`, `bioRxiv`, or `ClinicalTrials.gov`.
+- If a trial has a linked paper, its abstract and PubPeer are merged.
+- Named authors appear as `[Source via "David Liu"]` or `[Source via "Ciaran Lee"]`.
+- Summaries are 4–6 sentences for papers, 2–3 for Reddit posts.
+- Ambiguities are flagged rather than guessed.
+
+---
 
 ## Design Rationale
 
-- **No local relevance filtering for filtered Reddit**: DeepSeek evaluates relevance, avoiding false negatives from simplistic keyword matching.
-- **3 oldest papers/trials per source**: Gives DeepSeek enough options to pick the most significant, while ensuring we see the earliest (closest to 5 weeks) publications.
-- **Top 3 Reddit posts per sub**: Ensures practical tips aren't missed if they're #2 or #3; DeepSeek then selects the most useful and filters out rants/memes/news.
+- **Fetch‑until‑unique**: Ensures exactly one candidate per source+term, avoiding duplicate notifications.
+- **Reddit normalisation**: Ratio of top post to average of next nine identifies subs with truly standout content.
+- **DeepSeek selection**: Minimal prompt – asks for "most significant" without over‑filtering, preserving recall.
 - **PubPeer never cancels**: Comments are noted but papers/trials are never removed.
-- **Reddit not filtered by keywords for top subs**: Useful lab advice, career posts, and discussions are caught even if they don't match keywords.
-- **Character caps above normal**: Ensure no meaningful content is lost while preventing rants from clogging the system.
-- **Peak hours guardrail**: Skips runs during DeepSeek peak pricing, retries after 2 hours.
-- **Web search not enabled**: Adds unnecessary cost and latency; DeepSeek's reasoning on provided context is sufficient and more reliable.
+- **Character caps above normal**: Prevents rambling from clogging tokens while keeping all meaningful information.
+- **Hourly cron with idempotency**: Reliable even if a scheduled run is missed.
+
+---
 
 ## Troubleshooting
 
-- **Manual run**: Go to Actions tab → select workflow → "Run workflow".
-- **Check logs**: Actions tab shows stdout/stderr from each run.
-- **Telegram not sending**: Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are correct.
-- **DeepSeek failures**: Check your API key and balance at platform.deepseek.com.
+- **Manual trigger**: Actions tab → "Run workflow".
+- **Logs**: Check the Actions run output.
+- **Telegram not sending**: Verify token and chat ID.
+- **DeepSeek failures**: Check API key and balance at platform.deepseek.com.
+
+---
 
 ## License
 
-MIT – use freely, modify as needed.
+MIT – use and modify freely.
