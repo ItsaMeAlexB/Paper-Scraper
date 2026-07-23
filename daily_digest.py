@@ -398,7 +398,7 @@ def get_pubpeer_note(identifier):
 # REDDIT SCRAPING (via Apify – no API keys, works from GitHub)
 # ===========================================================================
 
-client = ApifyClient(APIFY_TOKEN)
+client = ApifyClient(token=APIFY_TOKEN, enable_x402=False)
 
 def fetch_reddit_posts(subreddit, limit=20):
     """Fetch top posts from a subreddit using Apify."""
