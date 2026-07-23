@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily Digest – Gene Therapy / Editing / Delivery / Engineering
-Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via reddit-fetch);
+Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via old.reddit.com HTML scraping);
 selects most significant; summarises with DeepSeek V4 Flash; sends to Telegram.
 """
 
@@ -10,11 +10,12 @@ import sys
 import re
 import time
 import json
-import subprocess
 import logging
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
 
 import requests
+from bs4 import BeautifulSoup
 from Bio import Entrez, Medline
 
 # ----------------------------------------------------------------------
@@ -79,7 +80,7 @@ AUTHOR_RULES = [
 ]
 
 # ----------------------------------------------------------------------
-# REDDIT SUBREDDITS (no API keys needed)
+# REDDIT SUBREDDITS (scraped with old.reddit.com)
 # ----------------------------------------------------------------------
 
 SUBREDDITS = [
@@ -393,90 +394,175 @@ def get_pubpeer_note(identifier):
                 return "PubPeer unavailable"
     return "PubPeer unavailable"
 
-# ----------------------------------------------------------------------
-# HELPERS: Reddit (using reddit-fetch CLI – no API keys)
-# ----------------------------------------------------------------------
+# ===========================================================================
+# REDDIT SCRAPING (old.reddit.com HTML) – no API keys, no login
+# ===========================================================================
 
-def run_reddit_command(args):
-    cmd = ["reddit-fetch"] + args
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            logger.warning(f"reddit-fetch error: {result.stderr}")
-            return []
-        try:
-            data = json.loads(result.stdout)
-            if isinstance(data, dict) and "data" in data:
-                return data["data"]
-            return data
-        except json.JSONDecodeError:
-            items = []
-            for line in result.stdout.strip().split("\n"):
-                if line.strip():
-                    try:
-                        items.append(json.loads(line))
-                    except:
-                        pass
-            return items
-    except Exception as e:
-        logger.error(f"reddit-fetch failed: {e}")
-        return []
+USER_AGENT = "Mozilla/5.0 (compatible; DailyDigest/1.0; +https://github.com/yourrepo)"
+
+def _get_soup(url):
+    headers = {"User-Agent": USER_AGENT}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "html.parser")
 
 def fetch_reddit_posts(subreddit, limit=20):
-    args = ["top", subreddit, "--limit", str(limit), "--json"]
-    data = run_reddit_command(args)
+    """Fetch top posts from a subreddit using old.reddit.com HTML."""
+    url = f"https://old.reddit.com/r/{subreddit}/top/?t=week&limit={limit}"
+    soup = _get_soup(url)
     posts = []
     now = datetime.utcnow()
-    for p in data:
-        if not all(k in p for k in ("id", "title", "score", "num_comments", "subreddit", "created_utc", "selftext")):
+    # Each post is a div with class 'thing'
+    for thing in soup.find_all("div", class_="thing"):
+        # Extract data attributes
+        fullname = thing.get("data-fullname", "")
+        if not fullname:
             continue
-        post_age_days = (now - datetime.utcfromtimestamp(p["created_utc"])).days
-        if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
+        post_id = fullname.split("_")[-1] if "_" in fullname else fullname
+        score = thing.get("data-score")
+        try:
+            score = int(score) if score else 0
+        except:
+            score = 0
+        comments_count = thing.get("data-comments-count")
+        try:
+            comments_count = int(comments_count) if comments_count else 0
+        except:
+            comments_count = 0
+        permalink = thing.get("data-permalink", "")
+        if not permalink:
             continue
-        if p["score"] < 0:
+        url_full = f"https://reddit.com{permalink}"
+        created_utc = thing.get("data-timestamp")
+        try:
+            created_utc = int(created_utc) if created_utc else 0
+        except:
+            created_utc = 0
+        # Title
+        title_tag = thing.find("a", class_="title")
+        title = title_tag.text.strip() if title_tag else ""
+
+        # Selftext – may be in an expando div, but often not in listing.
+        # We'll fetch it from the comments page later if needed.
+        # For now, we store an empty selftext; we'll populate when fetching comments.
+        selftext = ""
+
+        # Filter by age
+        if created_utc:
+            post_age_days = (now - datetime.utcfromtimestamp(created_utc)).days
+            if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
+                continue
+        if score < 0:
             continue
-        if p["num_comments"] < MIN_REDDIT_COMMENTS:
+        if comments_count < MIN_REDDIT_COMMENTS:
             continue
+
         posts.append({
-            "id": p["id"],
-            "title": p["title"],
-            "url": p.get("url") or f"https://reddit.com{p.get('permalink', '')}",  # fixed: r → p
-            "score": p["score"],
-            "num_comments": p["num_comments"],
-            "subreddit": p["subreddit"],
-            "created_utc": p["created_utc"],
-            "selftext": p["selftext"][:CAPS["selftext"]],
+            "id": post_id,
+            "title": title,
+            "url": url_full,
+            "score": score,
+            "num_comments": comments_count,
+            "subreddit": subreddit,
+            "created_utc": created_utc,
+            "selftext": selftext,  # will be filled later
         })
     return posts
 
 def fetch_comments(post_url):
-    args = ["comments", post_url, "--json"]
-    data = run_reddit_command(args)
-    top_comments = sorted(data, key=lambda c: c.get("score", 0), reverse=True)[:3]
+    """Fetch top comments and replies from a post's HTML page."""
+    soup = _get_soup(post_url)
+    # Get selftext from the post body
+    selftext = ""
+    content_div = soup.find("div", class_="usertext-body")
+    if content_div:
+        selftext = content_div.get_text(strip=True)
+
+    # Extract comments – they are nested under div.thing with class 'comment'
+    # We need to parse the tree. We'll use a recursive approach.
+    # Comments are inside a div with id 'siteTable' or similar.
+    comments = []
+    # Find all top-level comment divs with class 'comment'
+    # They are direct children of the comment area.
+    comment_area = soup.find("div", class_="commentarea")
+    if not comment_area:
+        return []
+
+    # We'll iterate through the children of comment_area that are div.thing.comment
+    # and are not replies (replies are inside a div with class 'child').
+    # So we'll recursively parse.
+    def parse_comment(comment_div, depth=0):
+        # comment_div is a div.thing.comment
+        # Extract data
+        fullname = comment_div.get("data-fullname", "")
+        if not fullname:
+            return None
+        # Get score (may be hidden, use data-score)
+        score = comment_div.get("data-score")
+        try:
+            score = int(score) if score else 0
+        except:
+            score = 0
+        # Body
+        body_div = comment_div.find("div", class_="usertext-body")
+        body = body_div.get_text(strip=True) if body_div else ""
+        # Replies are inside a div with class 'child' (or 'nested')
+        replies = []
+        child_div = comment_div.find("div", class_="child")
+        if child_div:
+            for reply_div in child_div.find_all("div", class_="thing", recursive=False):
+                # Check if it's a comment (has data-fullname)
+                if reply_div.get("data-fullname"):
+                    reply_obj = parse_comment(reply_div, depth+1)
+                    if reply_obj:
+                        replies.append(reply_obj)
+        return {
+            "body": body[:CAPS["comment"]],
+            "score": score,
+            "replies": replies[:1]  # we only need top 1 reply, but we'll sort by score later
+        }
+
+    # Find top-level comment divs (direct children of comment_area)
+    top_level = []
+    for child in comment_area.children:
+        if child.name == "div" and "thing" in child.get("class", []) and "comment" in child.get("class", []):
+            top_level.append(child)
+    # Parse them
+    parsed_comments = []
+    for div in top_level:
+        parsed = parse_comment(div)
+        if parsed:
+            parsed_comments.append(parsed)
+
+    # Sort top-level comments by score (descending)
+    parsed_comments.sort(key=lambda x: x["score"], reverse=True)
+    # Take top 3
+    top_comments = parsed_comments[:3]
+    # For each, sort replies by score and take top 1
     result = []
     for c in top_comments:
-        comment_text = c.get("body", "")[:CAPS["comment"]]
-        if len(c.get("body", "")) > CAPS["comment"]:
-            logger.info(f"Comment truncated for {post_url}")
         replies = c.get("replies", [])
-        top_reply = sorted(replies, key=lambda r: r.get("score", 0), reverse=True)[0] if replies else {}
-        reply_text = top_reply.get("body", "")[:CAPS["reply"]]
-        if top_reply and len(top_reply.get("body", "")) > CAPS["reply"]:
-            logger.info(f"Reply truncated for {post_url}")
+        if replies:
+            # Sort replies by score (descending)
+            replies.sort(key=lambda r: r["score"], reverse=True)
+            top_reply = replies[0]
+        else:
+            top_reply = {"body": "", "score": 0}
         result.append({
-            "comment": comment_text,
-            "score": c.get("score", 0),
-            "reply": reply_text,
-            "reply_score": top_reply.get("score", 0) if top_reply else 0,
+            "comment": c["body"][:CAPS["comment"]],
+            "score": c["score"],
+            "reply": top_reply["body"][:CAPS["reply"]],
+            "reply_score": top_reply["score"],
         })
-    return result
+    return selftext, result  # return selftext and comments
 
+# Update get_reddit_cache_key as before
 def get_reddit_cache_key(subreddit, post_id):
     return f"reddit_{subreddit}_{post_id}"
 
-# ----------------------------------------------------------------------
+# ===========================================================================
 # DEEPSEEK V4 FLASH
-# ----------------------------------------------------------------------
+# ===========================================================================
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
@@ -743,9 +829,20 @@ def main():
     reddit_candidates = []
     for sub in SUBREDDITS:
         posts = fetch_reddit_posts(sub, limit=20)
+        # Remove cached posts
         fresh = [p for p in posts if get_reddit_cache_key(sub, p["id"]) not in sent]
+        # Keep top 10 by score
         top_ten = sorted(fresh, key=lambda x: x["score"], reverse=True)[:10]
         if len(top_ten) >= 2:
+            # For each, fetch selftext and comments (this adds time, but we only need top posts)
+            # We'll fetch comments for the top post later, but we need selftext for all top_ten?
+            # We can fetch selftext only for the top 1? Actually we use selftext in the summary.
+            # We'll fetch selftext for each top_ten post by fetching the comments page and extracting selftext.
+            # This is heavy; we can skip selftext and only get it for the final selected posts.
+            # But we need selftext for the ratio calculation? No, ratio is based on scores.
+            # For the final top 5, we'll fetch selftext and comments when we select them.
+            # So we don't need selftext now.
+            # We'll store the posts without selftext, then later fetch selftext for the top post of each sub.
             top1_score = top_ten[0]["score"]
             avg_rest = sum(p["score"] for p in top_ten[1:]) / (len(top_ten) - 1)
             ratio = top1_score / avg_rest if avg_rest > 0 else top1_score
@@ -762,7 +859,10 @@ def main():
     selected_reddit_posts = []
     for entry in top_subs:
         post = entry["top_post"]
-        post["comments"] = fetch_comments(post["url"])
+        # Fetch selftext and comments for this post
+        selftext, comments = fetch_comments(post["url"])
+        post["selftext"] = selftext[:CAPS["selftext"]]
+        post["comments"] = comments
         selected_reddit_posts.append(post)
 
     logger.info(f"Selected {len(selected_reddit_posts)} Reddit posts.")
