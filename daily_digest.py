@@ -26,8 +26,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 
-# Reddit credentials are no longer needed – we use reddit-fetch CLI
-
 # ----------------------------------------------------------------------
 # SEARCH TERMS
 # ----------------------------------------------------------------------
@@ -99,16 +97,16 @@ SUBREDDITS = [
     "statistics",
 ]
 
-MIN_REDDIT_COMMENTS = 1   # effectively no filter
-REDDIT_WINDOW_START = 1   # 1 day old minimum
-REDDIT_WINDOW_END = 8     # 8 days old maximum
+MIN_REDDIT_COMMENTS = 1
+REDDIT_WINDOW_START = 1
+REDDIT_WINDOW_END = 8
 
 # ----------------------------------------------------------------------
 # TIME WINDOWS (papers/trials: 4-5 weeks old)
 # ----------------------------------------------------------------------
 
-PAPER_WINDOW_START_DAYS = 35  # 5 weeks ago
-PAPER_WINDOW_END_DAYS = 28    # 4 weeks ago
+PAPER_WINDOW_START_DAYS = 35
+PAPER_WINDOW_END_DAYS = 28
 
 # ----------------------------------------------------------------------
 # CHARACTER CAPS
@@ -125,7 +123,7 @@ CAPS = {
 # CACHE
 # ----------------------------------------------------------------------
 
-CACHE_TTL = 35 * 24 * 60 * 60  # 5 weeks
+CACHE_TTL = 35 * 24 * 60 * 60
 CACHE_FILE = "sent_cache.txt"
 LAST_RUN_FILE = "last_run_date.txt"
 
@@ -165,7 +163,6 @@ def mark_run_today():
 # ----------------------------------------------------------------------
 
 def is_peak_hours():
-    """DeepSeek peak pricing: Beijing 9-12 & 14-18 = UTC 1-4 & 6-10"""
     h = datetime.utcnow().hour
     return (1 <= h < 4) or (6 <= h < 10)
 
@@ -443,7 +440,7 @@ def fetch_reddit_posts(subreddit, limit=20):
         posts.append({
             "id": p["id"],
             "title": p["title"],
-            "url": p.get("url") or f"https://reddit.com{r.get('permalink', '')}",
+            "url": p.get("url") or f"https://reddit.com{p.get('permalink', '')}",  # fixed: r → p
             "score": p["score"],
             "num_comments": p["num_comments"],
             "subreddit": p["subreddit"],
@@ -547,7 +544,7 @@ Reddit posts:
 """
 
     payload = {
-        "model": "deepseek-v4-flash",  # cheapest, best balance for science+finance
+        "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": 2500,
