@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 Daily Digest – Gene Therapy / Editing / Delivery / Engineering
-Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit; selects most significant;
-summarises with DeepSeek; sends to Telegram.
+Scrapes PubMed, bioRxiv, ClinicalTrials.gov, Reddit (via reddit-fetch);
+selects most significant; summarises with DeepSeek; sends to Telegram.
 """
 
 import os
 import sys
 import re
 import time
+import json
+import subprocess
 import logging
 from datetime import datetime, timedelta
 
 import requests
-import praw
 from Bio import Entrez, Medline
 
 # ----------------------------------------------------------------------
@@ -23,10 +24,9 @@ from Bio import Entrez, Medline
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
-REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "daily-digest/1.0")
-ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
+ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")   # still needed for PubMed
+
+# Reddit credentials are no longer needed – we use reddit-fetch CLI
 
 # ----------------------------------------------------------------------
 # SEARCH TERMS
@@ -81,7 +81,7 @@ AUTHOR_RULES = [
 ]
 
 # ----------------------------------------------------------------------
-# REDDIT SUBREDDITS
+# REDDIT SUBREDDITS (no API keys needed)
 # ----------------------------------------------------------------------
 
 SUBREDDITS = [
@@ -99,7 +99,7 @@ SUBREDDITS = [
     "statistics",
 ]
 
-MIN_REDDIT_COMMENTS = 1   # was 15, now effectively no filter (top posts have ≥1)
+MIN_REDDIT_COMMENTS = 1   # effectively no filter
 REDDIT_WINDOW_START = 1   # 1 day old minimum
 REDDIT_WINDOW_END = 8     # 8 days old maximum
 
@@ -184,18 +184,17 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 
 def fetch_with_retry(fetch_func, *args, retries=2, delay=5, **kwargs):
-    """Try a fetch function twice; sleep `delay` seconds between attempts."""
     for attempt in range(retries):
         try:
             result = fetch_func(*args, **kwargs)
-            if result:  # non-empty (list, dict, etc.)
+            if result:
                 return result
         except Exception as e:
             logger.warning(f"Fetch attempt {attempt+1} failed: {e}")
         if attempt < retries - 1:
             logger.info(f"Retrying in {delay} seconds...")
             time.sleep(delay)
-    return []  # fallback empty result
+    return []
 
 # ----------------------------------------------------------------------
 # HELPERS: PubMed
@@ -244,7 +243,6 @@ def extract_pubmed_data(record):
     }
 
 def fetch_pubmed_abstract_by_doi(doi):
-    """Return abstract and journal for a DOI, or None if not found."""
     try:
         pmids = pubmed_search(f'{doi}[doi]', retmax=1)
         if not pmids:
@@ -332,7 +330,6 @@ def parse_clinicaltrial(study):
     if not summary:
         summary = conditions_module.get("detailedDescription", "") or ""
 
-    # Extract linked references (look for PMID or DOI)
     linked_refs = []
     for ref in refs_module.get("references", []):
         citation = ref.get("citation", "")
@@ -360,7 +357,6 @@ def parse_clinicaltrial(study):
     }
 
 def get_paper_from_clinicaltrial_refs(linked_refs):
-    """Try to fetch abstract/journal from linked references."""
     for ref in linked_refs:
         if ref["type"] == "doi":
             result = fetch_pubmed_abstract_by_doi(ref["id"])
@@ -401,61 +397,95 @@ def get_pubpeer_note(identifier):
     return "PubPeer unavailable"
 
 # ----------------------------------------------------------------------
-# HELPERS: Reddit
+# HELPERS: Reddit (using reddit-fetch CLI – no API keys)
 # ----------------------------------------------------------------------
 
-def init_reddit():
-    return praw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        user_agent=REDDIT_USER_AGENT,
-    )
+def run_reddit_command(args):
+    """Run reddit-fetch and return parsed JSON, or [] on failure."""
+    cmd = ["reddit-fetch"] + args
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            logger.warning(f"reddit-fetch error: {result.stderr}")
+            return []
+        # reddit-fetch outputs JSON lines; parse as list
+        lines = result.stdout.strip().split("\n")
+        # Usually each line is a JSON object; combine if needed
+        # In practice, it outputs one JSON array for top, and one JSON array for comments.
+        # We'll try to parse the whole stdout as JSON; if it fails, parse line by line.
+        try:
+            data = json.loads(result.stdout)
+            # If data is a dict with 'data' key, unwrap
+            if isinstance(data, dict) and "data" in data:
+                return data["data"]
+            return data
+        except json.JSONDecodeError:
+            # Fallback: each line is a JSON object
+            items = []
+            for line in lines:
+                if line.strip():
+                    try:
+                        items.append(json.loads(line))
+                    except:
+                        pass
+            return items
+    except Exception as e:
+        logger.error(f"reddit-fetch failed: {e}")
+        return []
 
-def fetch_reddit_posts(subreddit_name, limit=20):
-    reddit = init_reddit()
-    sub = reddit.subreddit(subreddit_name)
+def fetch_reddit_posts(subreddit, limit=20):
+    """Fetch top posts from a subreddit using reddit-fetch."""
+    args = ["top", subreddit, "--limit", str(limit), "--json"]
+    data = run_reddit_command(args)
     posts = []
     now = datetime.utcnow()
-    for post in sub.top(time_filter="week", limit=limit):
-        post_age_days = (now - datetime.utcfromtimestamp(post.created_utc)).days
+    for p in data:
+        # reddit-fetch returns dict with keys: id, title, url, score, num_comments, subreddit, created_utc, selftext
+        # Ensure required fields exist
+        if not all(k in p for k in ("id", "title", "score", "num_comments", "subreddit", "created_utc", "selftext")):
+            continue
+        # Apply age filter
+        post_age_days = (now - datetime.utcfromtimestamp(p["created_utc"])).days
         if not (REDDIT_WINDOW_START <= post_age_days <= REDDIT_WINDOW_END):
             continue
-        if post.score < 0:
+        if p["score"] < 0:
             continue
-        if post.num_comments < MIN_REDDIT_COMMENTS:
+        if p["num_comments"] < MIN_REDDIT_COMMENTS:
             continue
         posts.append({
-            "id": post.id,
-            "title": post.title,
-            "url": post.url,
-            "score": post.score,
-            "num_comments": post.num_comments,
-            "subreddit": subreddit_name,
-            "created_utc": post.created_utc,
-            "selftext": post.selftext[:CAPS["selftext"]],
+            "id": p["id"],
+            "title": p["title"],
+            "url": p.get("url") or f"https://reddit.com{r.get('permalink', '')}",
+            "score": p["score"],
+            "num_comments": p["num_comments"],
+            "subreddit": p["subreddit"],
+            "created_utc": p["created_utc"],
+            "selftext": p["selftext"][:CAPS["selftext"]],
         })
     return posts
 
 def fetch_comments(post_url):
-    reddit = init_reddit()
-    submission = reddit.submission(url=post_url)
-    submission.comments.replace_more(limit=0)
-    top_comments = sorted(submission.comments, key=lambda c: c.score, reverse=True)[:3]
+    """Fetch top comments and replies for a post using reddit-fetch."""
+    args = ["comments", post_url, "--json"]
+    data = run_reddit_command(args)
+    # data is expected to be a list of comments, each with 'body', 'score', 'replies' (list)
+    top_comments = sorted(data, key=lambda c: c.get("score", 0), reverse=True)[:3]
     result = []
     for c in top_comments:
-        comment_text = c.body[:CAPS["comment"]]
-        if len(c.body) > CAPS["comment"]:
-            logger.info(f"Comment truncated for {post_url} (len={len(c.body)})")
-        c.replies.replace_more(limit=0)
-        replies = sorted(c.replies, key=lambda r: r.score, reverse=True)[:1]
-        reply_text = replies[0].body[:CAPS["reply"]] if replies else ""
-        if replies and len(replies[0].body) > CAPS["reply"]:
-            logger.info(f"Reply truncated for {post_url} (len={len(replies[0].body)})")
+        comment_text = c.get("body", "")[:CAPS["comment"]]
+        if len(c.get("body", "")) > CAPS["comment"]:
+            logger.info(f"Comment truncated for {post_url}")
+        replies = c.get("replies", [])
+        # sort replies by score and take top 1
+        top_reply = sorted(replies, key=lambda r: r.get("score", 0), reverse=True)[0] if replies else {}
+        reply_text = top_reply.get("body", "")[:CAPS["reply"]]
+        if top_reply and len(top_reply.get("body", "")) > CAPS["reply"]:
+            logger.info(f"Reply truncated for {post_url}")
         result.append({
             "comment": comment_text,
-            "score": c.score,
+            "score": c.get("score", 0),
             "reply": reply_text,
-            "reply_score": replies[0].score if replies else 0,
+            "reply_score": top_reply.get("score", 0) if top_reply else 0,
         })
     return result
 
@@ -472,7 +502,6 @@ def deepseek_summarize(candidates, reddit_posts):
     if not candidates and not reddit_posts:
         return ["No candidates found today."]
 
-    # Build candidate list for papers/trials
     paper_text = ""
     for i, item in enumerate(candidates, 1):
         source = item.get("source", "Unknown")
@@ -488,7 +517,6 @@ def deepseek_summarize(candidates, reddit_posts):
         pubpeer_note = item.get("pubpeer_note", "No PubPeer data")
         paper_text += f"{i}. Source: {source} | Search term: \"{search_term}\" | ID: {identifier} | Journal: {journal} | Lab: {lab} | Title: {title} | Abstract: {abstract} | PubPeer: {pubpeer_note}\n"
 
-    # Build reddit text
     reddit_text = ""
     for i, post in enumerate(reddit_posts, 1):
         sub = post.get("subreddit", "unknown")
@@ -502,7 +530,6 @@ def deepseek_summarize(candidates, reddit_posts):
                 comment_lines.append(f"  Reply: {c['reply']}")
         reddit_text += f"{i}. r/{sub}: \"{title}\"\n   Selftext: {selftext}\n   {chr(10).join(comment_lines)}\n"
 
-    # ─── EXACT PROMPT PROVIDED BY USER ───
     prompt = f"""
 You are a scientific summariser. Your task is to produce a daily digest.
 
@@ -533,7 +560,6 @@ Candidates:
 Reddit posts:
 {reddit_text}
 """
-    # ─── END USER PROMPT ───
 
     payload = {
         "model": "deepseek-chat",
@@ -573,7 +599,6 @@ def send_telegram(message):
 # ----------------------------------------------------------------------
 
 def main():
-    # 1. Check if already run today or peak hours
     if already_run_today():
         logger.info("Already run today, exiting.")
         return
@@ -584,19 +609,14 @@ def main():
     logger.info("Starting daily digest...")
     sent = load_cache()
     now = datetime.now()
-    all_candidates = []
-    selected_reddit_posts = []
 
-    # ------------------------------------------------------------------
-    # A. FETCH PAPERS / TRIALS
-    # ------------------------------------------------------------------
-
+    # ------------------- FETCH PAPERS -------------------
     pubmed_candidates = []
     biorxiv_candidates = []
     ct_candidates = []
     author_candidates = []
 
-    # --- PubMed ---
+    # PubMed
     for term in KEYWORDS:
         pmids = fetch_with_retry(pubmed_search, term, retmax=200)
         if pmids:
@@ -612,9 +632,9 @@ def main():
                             data["search_term"] = term
                             data["pubpeer_note"] = get_pubpeer_note(data["doi"])
                             pubmed_candidates.append(data)
-    time.sleep(1)  # delay between sources
+    time.sleep(1)
 
-    # --- bioRxiv ---
+    # bioRxiv
     for term in KEYWORDS:
         query = term.replace('"', '').replace(' AND ', '+').replace(' ', '+')
         papers = fetch_with_retry(biorxiv_search, query, limit=100)
@@ -633,7 +653,7 @@ def main():
                     biorxiv_candidates.append(data)
     time.sleep(1)
 
-    # --- ClinicalTrials.gov ---
+    # ClinicalTrials.gov
     for term in CT_KEYWORDS:
         studies = fetch_with_retry(clinicaltrials_search, term, limit=100)
         for study in studies:
@@ -664,7 +684,7 @@ def main():
                         ct_candidates.append(data)
     time.sleep(1)
 
-    # --- Named authors ---
+    # Named authors
     for author_rule in AUTHOR_RULES:
         for query in author_rule["pubmed_queries"]:
             pmids = fetch_with_retry(pubmed_search, query, retmax=50)
@@ -699,24 +719,21 @@ def main():
                     data["author_label"] = author_rule["name"]
                     author_candidates.append(data)
 
-    # Combine non‑author candidates and dedupe by (source, term) → pick oldest
+    # Combine and dedupe
     all_raw = pubmed_candidates + biorxiv_candidates + ct_candidates
     groups = {}
     for cand in all_raw:
         key = (cand.get("source"), cand.get("search_term"))
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(cand)
+        groups.setdefault(key, []).append(cand)
 
     selected = []
     for (source, term), items in groups.items():
         sorted_items = sorted(items, key=lambda x: parse_pubmed_date(x.get("date")) or parse_clinicaltrial_date(x.get("date")) or now)
-        if sorted_items:
-            for item in sorted_items:
-                key_id = item.get("doi") or item.get("nct_id")
-                if key_id and key_id not in sent:
-                    selected.append(item)
-                    break
+        for item in sorted_items:
+            key_id = item.get("doi") or item.get("nct_id")
+            if key_id and key_id not in sent:
+                selected.append(item)
+                break
 
     # Named authors: 1 oldest per author
     author_final = []
@@ -730,22 +747,17 @@ def main():
         if sorted_auth:
             author_final.append(sorted_auth[0])
 
-    # Final unique set by ID
     seen_ids = set()
-    unique_selected = []
+    all_candidates = []
     for item in selected + author_final:
         key_id = item.get("doi") or item.get("nct_id")
         if key_id and key_id not in seen_ids:
             seen_ids.add(key_id)
-            unique_selected.append(item)
+            all_candidates.append(item)
 
-    all_candidates = unique_selected
     logger.info(f"Selected {len(all_candidates)} unique paper/trial candidates.")
 
-    # ------------------------------------------------------------------
-    # B. REDDIT
-    # ------------------------------------------------------------------
-
+    # ------------------- REDDIT -------------------
     reddit_candidates = []
     for sub in SUBREDDITS:
         posts = fetch_reddit_posts(sub, limit=20)
@@ -773,41 +785,32 @@ def main():
 
     logger.info(f"Selected {len(selected_reddit_posts)} Reddit posts.")
 
-    # ------------------------------------------------------------------
-    # C. DEEPSEEK
-    # ------------------------------------------------------------------
-
+    # ------------------- DEEPSEEK -------------------
     if not all_candidates and not selected_reddit_posts:
         send_telegram("⚠️ No new relevant papers, trials, or Reddit posts found today.")
         return
 
     summary_lines = deepseek_summarize(all_candidates, selected_reddit_posts)
 
-    # ------------------------------------------------------------------
-    # D. SEND TELEGRAM
-    # ------------------------------------------------------------------
+    # ------------------- TELEGRAM -------------------
     date_str = now.strftime("%B %d, %Y")
     if summary_lines:
-        # The prompt already includes "🧬 **[Date]**" – we may need to ensure the date is inserted.
-        # We'll look for the first line starting with "🧬" and replace it if needed.
-        # But the prompt instructs to output "🧬 **[Date]**" – we can let DeepSeek fill it.
-        # However, we can also prepend if missing – we'll check.
-        if summary_lines and not any("🧬" in line for line in summary_lines[:3]):
-            summary_lines.insert(0, f"🧬 **{date_str}**")
-        # If there is a line with "🧬 **[Date]**", we can replace it with the actual date.
+        # Replace placeholder date if present
         for i, line in enumerate(summary_lines):
             if "🧬 **[Date]**" in line:
                 summary_lines[i] = f"🧬 **{date_str}**"
                 break
+        else:
+            # If no placeholder found, insert at top
+            if not any("🧬" in line for line in summary_lines[:3]):
+                summary_lines.insert(0, f"🧬 **{date_str}**")
     else:
         summary_lines = ["⚠️ DeepSeek summarisation failed."]
 
     final_msg = "\n".join(summary_lines)
     send_telegram(final_msg)
 
-    # ------------------------------------------------------------------
-    # E. UPDATE CACHE
-    # ------------------------------------------------------------------
+    # ------------------- CACHE -------------------
     for item in all_candidates:
         key = item.get("doi") or item.get("nct_id")
         if key:
