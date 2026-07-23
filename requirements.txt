@@ -1,4 +1,4 @@
 biopython
 requests
 beautifulsoup4
-curl_cffi
+apify-client
