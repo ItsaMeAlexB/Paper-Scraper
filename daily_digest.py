@@ -25,7 +25,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
-APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN")   # <-- new
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")   # <-- new
 
 # ----------------------------------------------------------------------
 # SEARCH TERMS
