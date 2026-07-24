@@ -1,6 +1,6 @@
 name: Auto-Fix Digest
 on:
-  workflow_dispatch:   # manual trigger only
+  workflow_dispatch:
 
 jobs:
   run-and-fix:
@@ -19,7 +19,7 @@ jobs:
 
       - name: Run digest (capture output)
         id: digest
-        continue-on-error: true   # allows failure without stopping the workflow
+        continue-on-error: true
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -28,7 +28,6 @@ jobs:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
           python daily_digest.py 2>&1 | tee digest_output.txt
-          # If the script fails, we still have output in the file
 
       - name: Auto-fix on failure
         if: steps.digest.outcome == 'failure'
@@ -38,9 +37,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          ERROR_LOG: ${{ steps.digest.outputs.stdout }}  # Not set – use file
         run: |
-          # Read the captured output
           ERROR_LOG=$(cat digest_output.txt)
-          # Pass it to auto_fix.py via environment variable
-          export ERROR_LOG="$ERROR_LOG"
+          export ERROR_LOG
           python auto_fix.py
