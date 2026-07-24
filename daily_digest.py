@@ -11,6 +11,7 @@ import re
 import time
 import json
 import logging
+import random
 from datetime import datetime, timedelta
 
 import requests
@@ -176,21 +177,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# RETRY WRAPPER
+# ROBUST RETRY WRAPPER (exception‑safe, with jitter & backoff)
 # ----------------------------------------------------------------------
 
-def fetch_with_retry(fetch_func, *args, retries=2, delay=5, **kwargs):
+def fetch_with_retry(fetch_func, *args, retries=3, delay=5, backoff=2, **kwargs):
+    """
+    Call fetch_func(*args, **kwargs) with exponential backoff and jitter.
+    Raises the last exception if all retries fail.
+    """
+    last_exception = None
     for attempt in range(retries):
         try:
-            result = fetch_func(*args, **kwargs)
-            if result:
-                return result
+            return fetch_func(*args, **kwargs)
         except Exception as e:
-            logger.warning(f"Fetch attempt {attempt+1} failed: {e}")
-        if attempt < retries - 1:
-            logger.info(f"Retrying in {delay} seconds...")
-            time.sleep(delay)
-    return []
+            last_exception = e
+            logger.warning(f"Attempt {attempt+1} failed for {fetch_func.__name__}: {e}")
+            if attempt < retries - 1:
+                sleep_time = delay * (backoff ** attempt) + random.uniform(0, 1)
+                logger.info(f"Retrying in {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+    logger.error(f"All {retries} attempts failed for {fetch_func.__name__}")
+    raise last_exception
 
 # ----------------------------------------------------------------------
 # HELPERS: PubMed
@@ -396,7 +403,7 @@ def get_pubpeer_note(identifier):
 # REDDIT SCRAPING (via Apify REST API – no SDK, no x402)
 # ===========================================================================
 
-def call_apify_actor(input_data, timeout_seconds=60):
+def call_apify_actor(input_data, timeout_seconds=120):
     """
     Run an Apify actor via REST API and return the dataset items.
     Uses Bearer token authentication – no x402.
@@ -404,7 +411,7 @@ def call_apify_actor(input_data, timeout_seconds=60):
     if not APIFY_TOKEN:
         raise ValueError("APIFY_TOKEN environment variable is not set.")
 
-    run_url = "https://api.apify.com/v2/acts/apify/reddit-scraper/runs"  # correct slash
+    run_url = "https://api.apify.com/v2/acts/apify/reddit-scraper/runs"
     headers = {
         "Authorization": f"Bearer {APIFY_TOKEN}",
         "Content-Type": "application/json"
@@ -435,7 +442,7 @@ def fetch_reddit_posts(subreddit, limit=20):
         "limit": limit,
         "time": "week"
     }
-    items = call_apify_actor(input_data)
+    items = fetch_with_retry(call_apify_actor, input_data, retries=3, delay=10)
 
     posts = []
     now = datetime.utcnow()
@@ -472,7 +479,7 @@ def fetch_comments(post_url):
         "limit": 10,
     }
     try:
-        items = call_apify_actor(input_data)
+        items = fetch_with_retry(call_apify_actor, input_data, retries=2, delay=10)
     except Exception as e:
         logger.warning(f"Apify comments fetch failed for {post_url}: {e}")
         return []
@@ -576,14 +583,10 @@ Reddit posts:
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
-    try:
-        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip().split("\n")
-    except Exception as e:
-        logger.error(f"DeepSeek API error: {e}")
-        return []
+    resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip().split("\n")
 
 # ----------------------------------------------------------------------
 # TELEGRAM
@@ -592,12 +595,9 @@ Reddit posts:
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        resp = requests.post(url, json=payload, timeout=30)
-        resp.raise_for_status()
-        logger.info("Telegram message sent.")
-    except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
+    resp = requests.post(url, json=payload, timeout=30)
+    resp.raise_for_status()  # will be caught by retry wrapper
+    logger.info("Telegram message sent.")
 
 # ----------------------------------------------------------------------
 # MAIN
@@ -625,7 +625,7 @@ def main():
     for term in KEYWORDS:
         pmids = fetch_with_retry(pubmed_search, term, retmax=200)
         if pmids:
-            records = pubmed_fetch(pmids)
+            records = fetch_with_retry(pubmed_fetch, pmids)   # <-- now wrapped
             for rec in records:
                 data = extract_pubmed_data(rec)
                 if data["doi"] and data["doi"] not in sent:
@@ -694,7 +694,7 @@ def main():
         for query in author_rule["pubmed_queries"]:
             pmids = fetch_with_retry(pubmed_search, query, retmax=50)
             if pmids:
-                records = pubmed_fetch(pmids)
+                records = fetch_with_retry(pubmed_fetch, pmids)   # <-- wrapped
                 for rec in records:
                     data = extract_pubmed_data(rec)
                     if data["doi"] and data["doi"] not in sent:
@@ -796,7 +796,7 @@ def main():
         send_telegram("⚠️ No new relevant papers, trials, or Reddit posts found today.")
         return
 
-    summary_lines = deepseek_summarize(all_candidates, selected_reddit_posts)
+    summary_lines = fetch_with_retry(deepseek_summarize, all_candidates, selected_reddit_posts, retries=2, delay=10)
 
     # ------------------- TELEGRAM -------------------
     date_str = now.strftime("%B %d, %Y")
@@ -812,7 +812,7 @@ def main():
         summary_lines = ["⚠️ DeepSeek summarisation failed."]
 
     final_msg = "\n".join(summary_lines)
-    send_telegram(final_msg)
+    fetch_with_retry(send_telegram, final_msg, retries=3, delay=5)
 
     # ------------------- CACHE -------------------
     for item in all_candidates:
