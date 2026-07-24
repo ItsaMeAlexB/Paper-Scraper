@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import os
-import sys
 import re
-import json
+import sys
 import subprocess
 import requests
 from github import Github, GithubException
@@ -11,44 +10,72 @@ from datetime import datetime
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 REPO_NAME = os.environ["GITHUB_REPOSITORY"]
-ERROR_LOG = os.environ.get("ERROR_LOG", "No error log captured.")
+ERROR_LOG = os.environ.get("ERROR_LOG", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-# Files to potentially modify
-FILES = {
-    "daily_digest.py": "daily_digest.py",
-    ".github/workflows/auto-fix.yml": ".github/workflows/auto-fix.yml",
-    ".github/workflows/daily.yml": ".github/workflows/daily.yml",
-    "requirements.txt": "requirements.txt",
-    "README.md": "README.md",
-}
 
 def send_telegram(msg):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
 
-def call_deepseek(error_log, files_content):
+def extract_error_context(error_log):
+    """Return (file_path, line_num, func_name, error_summary)"""
+    tb_pattern = r'File "(.+?)", line (\d+), in (.+?)\n'
+    matches = re.findall(tb_pattern, error_log)
+    if not matches:
+        return None, None, None, error_log[:500]
+    # Find the first .py file that is not the auto-fix script itself
+    for file_path, line_num, func_name in matches:
+        if file_path.endswith(".py") and "auto_fix" not in file_path:
+            return file_path, int(line_num), func_name, error_log[:500]
+    # If no Python error, look for any file (could be YAML)
+    for file_path, line_num, func_name in matches:
+        return file_path, int(line_num), func_name, error_log[:500]
+    return None, None, None, error_log[:500]
+
+def extract_block(file_path, line_num, func_name=None, context_lines=10):
+    """Extract a block: entire function if Python, else surrounding lines."""
+    if not os.path.exists(file_path):
+        return None
+    with open(file_path, "r") as f:
+        lines = f.readlines()
+    if file_path.endswith(".py") and func_name:
+        # Extract the whole function definition
+        start = None
+        indent = None
+        for i, line in enumerate(lines):
+            if re.match(rf"def {func_name}\(", line):
+                start = i
+                indent = len(line) - len(line.lstrip())
+                break
+        if start is None:
+            return None
+        end = len(lines)
+        for i in range(start+1, len(lines)):
+            if re.match(r"^\s*def ", lines[i]) and (len(lines[i]) - len(lines[i].lstrip())) <= indent:
+                end = i
+                break
+        return "".join(lines[start:end])
+    else:
+        # For YAML or others: return context around the error line
+        start = max(0, line_num - context_lines - 1)
+        end = min(len(lines), line_num + context_lines)
+        return "".join(lines[start:end])
+
+def call_deepseek(error_summary, block, file_path):
     prompt = f"""
-You are an expert Python/DevOps engineer. Fix the error in the provided files.
-The error occurred while running the digest script.
+Fix the error in the following code block. The error occurred in file: {file_path}
 
-Error log:
-{error_log[:8000]}
+Error:
+{error_summary}
 
-Current file contents:
-"""
-    for path, content in files_content.items():
-        prompt += f"\n### FILE: {path}\n{content}\n"
+Code block:
+{block}
 
-    prompt += """
-Return the corrected files. For each file, output:
-### FILE: <path>
-<entire corrected content>
-
-Do not include any other text. Keep the file paths exactly as given.
-Stay as close as possible to the intended function.
+Return only the corrected code block, with no extra text or explanations.
+Keep the code as close as possible to the original intended function.
+If the API format needs adjustment, refer to known documentation.
 """
     resp = requests.post(
         "https://api.deepseek.com/v1/chat/completions",
@@ -56,18 +83,25 @@ Stay as close as possible to the intended function.
         json={
             "model": "deepseek-v4-flash",
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "max_tokens": 4000,
+            "temperature": 0.1,
+            "max_tokens": 800,  # enough for a function
         },
-        timeout=90,
+        timeout=60,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
-def parse_deepseek_response(response_text):
-    pattern = r"### FILE: (.+?)\n(.*?)(?=\n### FILE:|$)"
-    matches = re.findall(pattern, response_text, re.DOTALL)
-    return {path.strip(): content.strip() for path, content in matches}
+def patch_file(file_path, old_block, new_block):
+    """Replace old_block with new_block in file."""
+    with open(file_path, "r") as f:
+        content = f.read()
+    # Use simple string replace (the block is unique)
+    new_content = content.replace(old_block, new_block)
+    if new_content == content:
+        raise ValueError("No replacement made – block not found.")
+    with open(file_path, "w") as f:
+        f.write(new_content)
+    return new_content
 
 def test_fix():
     try:
@@ -78,47 +112,46 @@ def test_fix():
 
 def main():
     try:
-        # Read current files
-        files_content = {}
-        for path, rel_path in FILES.items():
-            try:
-                with open(rel_path, "r") as f:
-                    files_content[path] = f.read()
-            except FileNotFoundError:
-                files_content[path] = "# File not found"
-
-        # Call DeepSeek
-        fixed_response = call_deepseek(ERROR_LOG, files_content)
-        new_files = parse_deepseek_response(fixed_response)
-        if not new_files:
-            send_telegram("❌ Auto-fix: DeepSeek returned no files.")
+        # Parse error
+        file_path, line_num, func_name, error_summary = extract_error_context(ERROR_LOG)
+        if not file_path:
+            send_telegram("❌ Auto-fix: Could not locate error file.")
             sys.exit(1)
 
-        # Write new files
-        for path, content in new_files.items():
-            if path in FILES:
-                actual_path = FILES[path]
-                with open(actual_path, "w") as f:
-                    f.write(content)
-                print(f"Updated {actual_path}")
+        # Extract block
+        block = extract_block(file_path, line_num, func_name)
+        if not block:
+            send_telegram(f"❌ Auto-fix: Could not extract block from {file_path}.")
+            sys.exit(1)
+
+        # Get fix from DeepSeek
+        fixed_block = call_deepseek(error_summary, block, file_path)
+        if not fixed_block.strip():
+            send_telegram("❌ Auto-fix: DeepSeek returned empty.")
+            sys.exit(1)
+
+        # Apply patch
+        patch_file(file_path, block, fixed_block)
 
         # Test
         if test_fix():
             # Commit and push
             repo = Github(GITHUB_TOKEN).get_repo(REPO_NAME)
-            branch = repo.get_branch("main")
-            commit_msg = f"Auto-fix: attempt to resolve error at {datetime.utcnow().isoformat()}"
-            for path, content in new_files.items():
-                if path in FILES:
-                    actual_path = FILES[path]
-                    try:
-                        contents = repo.get_contents(actual_path, ref="main")
-                        repo.update_file(actual_path, commit_msg, content, contents.sha, branch="main")
-                    except GithubException:
-                        repo.create_file(actual_path, commit_msg, content, branch="main")
-            send_telegram(f"✅ Auto-fix applied. Changes pushed to main.\nCommit: {commit_msg}")
+            commit_msg = f"Auto-fix: {file_path} – {error_summary[:100]}"
+            try:
+                contents = repo.get_contents(file_path, ref="main")
+                repo.update_file(file_path, commit_msg, open(file_path).read(), contents.sha, branch="main")
+            except GithubException:
+                repo.create_file(file_path, commit_msg, open(file_path).read(), branch="main")
+            # Telegram with diff (show changed lines)
+            send_telegram(
+                f"✅ Auto-fix applied to {file_path}\n"
+                f"Error: {error_summary[:200]}\n"
+                f"Commit: {commit_msg}\n"
+                f"Replaced block:\n```\n{block[:300]}...\n```\nwith:\n```\n{fixed_block[:300]}...\n```"
+            )
         else:
-            send_telegram("❌ Auto-fix attempted but test failed. Manual intervention required.")
+            send_telegram(f"❌ Auto-fix failed test after patching {file_path}. Manual check needed.")
             sys.exit(1)
 
     except Exception as e:
