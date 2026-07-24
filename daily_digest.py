@@ -293,16 +293,10 @@ def parse_biorxiv_paper(paper):
 CLINICALTRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
 def clinicaltrials_search(query, limit=100):
-    status_filter = (
-        "AREA[OverallStatus]ACTIVE OR "
-        "AREA[OverallStatus]NOT_YET_RECRUITING OR "
-        "AREA[OverallStatus]RECRUITING OR "
-        "AREA[OverallStatus]ENROLLING_BY_INVITATION OR "
-        "AREA[OverallStatus]COMPLETED"
-    )
-    full_query = f"({query}) AND ({status_filter})"
+    statuses = "ACTIVE,NOT_YET_RECRUITING,RECRUITING,ENROLLING_BY_INVITATION,COMPLETED"
     params = {
-        "query.term": full_query,
+        "query.term": query,
+        "filter.overallStatus": statuses,
         "pageSize": min(limit, 100),
         "format": "json",
     }
