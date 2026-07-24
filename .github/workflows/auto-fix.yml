@@ -41,4 +41,9 @@ jobs:
         run: |
           ERROR_LOG=$(cat digest_output.txt)
           export ERROR_LOG
-          python auto_fix.py
+          python auto_fix.py 2>&1 | tee auto_fix_output.txt
+          if [ $? -ne 0 ]; then
+            echo "Auto-fix failed. Output:"
+            cat auto_fix_output.txt
+            exit 1
+          fi
