@@ -1,4 +1,3 @@
 biopython
 requests
 beautifulsoup4
-PyGithub
