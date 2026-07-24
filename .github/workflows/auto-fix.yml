@@ -1,0 +1,46 @@
+name: Auto-Fix Digest
+on:
+  workflow_dispatch:   # manual trigger only
+
+jobs:
+  run-and-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run digest (capture output)
+        id: digest
+        continue-on-error: true   # allows failure without stopping the workflow
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: |
+          python daily_digest.py 2>&1 | tee digest_output.txt
+          # If the script fails, we still have output in the file
+
+      - name: Auto-fix on failure
+        if: steps.digest.outcome == 'failure'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          # Read the captured output
+          ERROR_LOG=$(cat digest_output.txt)
+          # Pass it to auto_fix.py via environment variable
+          export ERROR_LOG="$ERROR_LOG"
+          python auto_fix.py
