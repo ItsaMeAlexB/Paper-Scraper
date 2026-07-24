@@ -294,12 +294,10 @@ CLINICALTRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
 def clinicaltrials_search(query, limit=100):
     statuses = "ACTIVE,NOT_YET_RECRUITING,RECRUITING,ENROLLING_BY_INVITATION,COMPLETED"
-    params = {
-        "query.term": query,
-        "filter.overallStatus": statuses,
-        "pageSize": min(limit, 100),
-        "format": "json",
-    }
+params = {
+    "query.term": query.strip('"'),  # removes surrounding quotes
+    ...
+}
     resp = requests.get(CLINICALTRIALS_API, params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
