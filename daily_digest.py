@@ -182,7 +182,8 @@ BIORXIV_API = "https://api.biorxiv.org/details/biorxiv/"
 
 def biorxiv_search(query, limit=20):
     url = f"{BIORXIV_API}{query}/{limit}/0/json"
-    resp = requests.get(url, timeout=30)
+    headers = {"User-Agent": "Mozilla/5.0"}   # FIX: added User-Agent
+    resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     return data.get("collection", [])
@@ -204,12 +205,12 @@ CLINICALTRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
 def clinicaltrials_search_date_filtered(query, start_date, end_date, limit=5):
     statuses = "ACTIVE_NOT_RECRUITING,NOT_YET_RECRUITING,RECRUITING,ENROLLING_BY_INVITATION,COMPLETED"
-    start_str = start_date.strftime("%Y-%m-%dT00:00:00+00:00")
-    end_str = end_date.strftime("%Y-%m-%dT23:59:59+00:00")
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
     params = {
         "query.term": query.strip('"'),
         "filter.overallStatus": statuses,
-        "filter.updatedDate": f"{start_str} TO {end_str}",
+        "filter.updatedDate": f"BETWEEN[{start_str},{end_str}]",   # FIX: correct syntax
         "pageSize": min(limit, 100),
         "format": "json",
         "sort": "lastUpdatePostDate",
@@ -405,6 +406,7 @@ def deepseek_summarize(candidates, reddit_posts, date_str):
                 comment_lines.append(f"  Reply: {c['reply']}")
         reddit_text += f"{i}. r/{sub}: \"{title}\"\n   Selftext: {selftext}\n   {chr(10).join(comment_lines)}\n"
 
+    # FIX: Removed date and section headers, just numbered lists
     prompt = f"""
 You are a scientific summariser. Your task is to produce a daily digest.
 
@@ -413,16 +415,9 @@ From the list of papers/preprints/trials below, select the **5 most significant*
 
 From the list of Reddit posts below, select the **5 most scientifically relevant discussions**. For each, produce a summary of 2–3 sentences.
 
-**Output format** (use these sections exactly):
-
-🧬 **{date_str}**
-
-**Papers / Trials (most significant):**
-1. [Journal/ClinicalTrials.gov via "search_term" or "author name"] ID: ... – summary – Lab name. PubPeer: [brief summary, e.g., "2 critical comments, question Fig.2's authenticity"].
-2. ...
-
-**Reddit (useful posts):**
-1. r/subreddit: "Title" – summary of post, then summary of comments/replies, e.g., "Comments agree on usefulness but caution against high voltage." or "Comments answer with Gibson Assembly or TEDA as the best method".
+**Output format (plain text, no markdown):**
+Just output a numbered list for papers/trials (starting with 1.) and then a numbered list for Reddit posts (continuing numbering or starting anew? We'll start a new list with 1. for Reddit). 
+The source (journal, ClinicalTrials.gov, r/subreddit) should be mentioned naturally within each summary.
 
 **Rules for handling uncertainty:**
 - If you encounter ambiguous terms, acronyms, or concepts you are unsure about, include them verbatim – do not guess, ignore, or hallucinate.
@@ -452,11 +447,15 @@ Reddit posts:
 # TELEGRAM
 # ----------------------------------------------------------------------
 def send_telegram(message):
+    # Send plain text (no parse_mode) and split into chunks if too long
+    max_len = 4096
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    resp = requests.post(url, json=payload, timeout=30)
-    resp.raise_for_status()
-    logger.info("Telegram message sent.")
+    for i in range(0, len(message), max_len):
+        chunk = message[i:i+max_len]
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        logger.info("Telegram chunk sent.")
 
 # ----------------------------------------------------------------------
 # MAIN
@@ -648,12 +647,13 @@ def main():
     # 3. DEEPSEEK
     # ------------------------------------------------------------
     if not all_candidates and not reddit_posts:
-        send_telegram("⚠️ No new relevant papers, trials, or Reddit posts found today.")
+        send_telegram("No new relevant papers, trials, or Reddit posts found today.")
         return
 
     date_str = now.strftime("%B %d, %Y")
     summary_lines = fetch_with_retry(deepseek_summarize, all_candidates, reddit_posts, date_str, retries=2, delay=10)
 
+    # Combine lines into a single message (plain text)
     final_msg = "\n".join(summary_lines)
     send_telegram(final_msg)
 
