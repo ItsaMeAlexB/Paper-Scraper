@@ -7,7 +7,6 @@ import json
 import logging
 import random
 from datetime import datetime, timezone, timedelta
-import zoneinfo
 
 import requests
 from Bio import Entrez, Medline
@@ -20,18 +19,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 
-# Search terms (PubMed only)
-KEYWORDS = [
-    '"gene therapy"',
-    '"gene edit*"',
-    '"gene deliver*"',
-    '"computational biology"',
-    '"DNA repair"',
-    'epigenetic*',
-    'immune response AND (vector OR edit* OR damage OR expression)',
-    'manufacture',
-    '(discover* OR engineer*) AND protein',
-]
+# Four search terms (sections)
+TERMS = {
+    "Gene Therapy": '"gene therapy" OR "genome therapy" OR "genetic therapy"',
+    "Editing": '"gene edit*" OR "genome edit*" OR "gene engineer*" OR "genome engineer*" OR "genetic edit*" OR "genetic engineer*"',
+    "Computation": '"computational biology"',
+    "Delivery": 'delivery OR vector',
+}
 
 # Named authors – full names as specified
 AUTHOR_TERMS = [
@@ -46,11 +40,7 @@ DEEPSEEK_PEAK_ENDS   = [4, 10]
 # ----------------------------------------------------------------------
 # LOGGING
 # ----------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
@@ -65,32 +55,51 @@ def is_deepseek_peak():
     return False
 
 # ----------------------------------------------------------------------
-# PUBMED HELPERS
+# PUBMED HELPERS – fetch ALL results for a query in a date range
 # ----------------------------------------------------------------------
-def fetch_pubmed_top(query):
-    """Fetch the newest paper for a given query."""
+def fetch_all_pmids(query, start_date, end_date, max_results=10000):
     Entrez.email = ENTREZ_EMAIL
-    try:
-        handle = Entrez.esearch(db="pubmed", term=query, retmax=1, sort="pub date")
+    start_str = start_date.strftime("%Y/%m/%d")
+    end_str = end_date.strftime("%Y/%m/%d")
+    pmids = []
+    retstart = 0
+    retmax = 1000
+    while True:
+        handle = Entrez.esearch(db="pubmed", term=query,
+                                mindate=start_str, maxdate=end_str,
+                                retstart=retstart, retmax=retmax, sort="pub date")
         record = Entrez.read(handle)
         handle.close()
-        pmids = record["IdList"]
-        if not pmids:
-            return None
-        handle = Entrez.efetch(db="pubmed", id=pmids[0], rettype="medline", retmode="text")
-        records = list(Medline.parse(handle))
+        batch = record["IdList"]
+        if not batch:
+            break
+        pmids.extend(batch)
+        retstart += retmax
+        if retstart >= int(record["Count"]) or retstart >= max_results:
+            break
+        time.sleep(0.3)
+    return pmids
+
+def fetch_metadata(pmids):
+    if not pmids:
+        return []
+    Entrez.email = ENTREZ_EMAIL
+    records = []
+    for i in range(0, len(pmids), 200):
+        chunk = pmids[i:i+200]
+        handle = Entrez.efetch(db="pubmed", id=",".join(chunk), rettype="medline", retmode="text")
+        recs = list(Medline.parse(handle))
         handle.close()
-        if not records:
-            return None
-        rec = records[0]
+        records.extend(recs)
+        time.sleep(0.3)
+    papers = []
+    for rec in records:
         doi = None
         for id_ in rec.get("AID", []):
             if id_.endswith(" [doi]"):
                 doi = id_.replace(" [doi]", "")
                 break
-        if not doi:
-            return None
-        return {
+        papers.append({
             "doi": doi,
             "title": rec.get("TI", ""),
             "abstract": rec.get("AB", ""),
@@ -98,50 +107,104 @@ def fetch_pubmed_top(query):
             "journal": rec.get("JT", ""),
             "date": rec.get("DP", ""),
             "pmid": rec.get("PMID", ""),
-            "source": "PubMed",
-            "query": query,
-        }
-    except Exception as e:
-        logger.warning(f"Error fetching for {query}: {e}")
-        return None
+        })
+    return papers
 
 # ----------------------------------------------------------------------
-# DEEPSEEK
+# DEEPSEEK HELPERS
 # ----------------------------------------------------------------------
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-def deepseek_summarize(candidates, date_str):
-    paper_text = ""
-    for i, item in enumerate(candidates, 1):
-        source = item.get("source", "PubMed")
-        search_term = item.get("query", "")
-        identifier = item.get("doi") or "N/A"
-        journal = item.get("journal", "")
-        lab = item.get("authors", [""])[-1] if item.get("authors") else "unknown"
-        title = item.get("title", "")
-        abstract = item.get("abstract", "")[:2000]
-        paper_text += f"{i}. Source: {source} | Search: \"{search_term}\" | ID: {identifier} | Journal: {journal} | Lab: {lab} | Title: {title} | Abstract: {abstract}\n"
+def deepseek_select_titles(term_papers):
+    """Single call to select one title per section."""
+    # Build the prompt with all sections and titles
+    sections_text = ""
+    for section_name, papers in term_papers.items():
+        sections_text += f"{section_name}:\n"
+        if not papers:
+            sections_text += "NO_TITLES\n\n"
+        else:
+            for i, p in enumerate(papers, 1):
+                sections_text += f"{i}. {p['title']}\n"
+            sections_text += "\n"
+
+    prompt = f"""For each of the following topics, from the list of titles provided, pick the 1 most useful paper based on its title (e.g. if it's a review it would explain something well), significant (e.g. if it's primary article it has interesting findings), and relevant (e.g. not just an article that mentions gene editing in passing or uses it as a method for investigating an irrelevant topic).
+
+Return your answer in the exact format below, with one title per topic. Use the exact titles as they appear.
+
+Topics and titles:
+
+{sections_text}
+
+If the list is empty, return "NO_TITLES".
+
+Format:
+Gene Therapy: <exact title>
+Editing: <exact title>
+Computation: <exact title>
+Delivery: <exact title>
+"""
+    payload = {
+        "model": "deepseek-v4-flash",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 500,
+    }
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    try:
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        response_text = data["choices"][0]["message"]["content"].strip()
+        logger.info(f"Selection response:\n{response_text}")
+        return response_text
+    except Exception as e:
+        logger.error(f"DeepSeek selection error: {e}")
+        return None
+
+def deepseek_summarize(selected_papers, author_papers, date_str):
+    section_text = ""
+    for section_name, paper in selected_papers.items():
+        if paper:
+            section_text += f"[{section_name}]\n"
+            section_text += f"Title: {paper['title']}\n"
+            section_text += f"Journal: {paper['journal']}\n"
+            section_text += f"Authors: {', '.join(paper['authors'][:5])}\n"
+            section_text += f"Abstract: {paper['abstract'][:1500]}\n\n"
+
+    author_text = ""
+    if author_papers:
+        author_text = "[Named Authors]\n"
+        for paper in author_papers:
+            author_text += f"Title: {paper['title']}\n"
+            author_text += f"Journal: {paper['journal']}\n"
+            author_text += f"Authors: {', '.join(paper['authors'][:5])}\n"
+            author_text += f"Abstract: {paper['abstract'][:1500]}\n\n"
 
     prompt = f"""You are a scientific summariser. Your task is to produce a daily digest.
 
-From the list of papers below, select the 5 with the most useful or significant information. For each, produce a summary of 3–5 sentences.
-**Note:** Results from named author searches (Liu, Lee) must always be included – if they appear in the list, they take priority.
+Today is {date_str}.
 
-**Output format** (use these sections exactly):
+For each of the following sections, there is a selected paper. Write a summary of 4–6 sentences that captures the key findings, significance, and context. Mention the journal and the lab (last author).
 
-🧬 **{date_str}**
+Sections:
+{section_text}
 
-**Papers (most significant):**
-1. [Journal via "search_term" or "author name"] ID: ... – summary – Lab name.
-2. ...
+Additionally, if any papers from named authors (David R. Liu or Ciaran M. Lee) are provided, write a separate summary for each (same length) as extra paragraphs.
 
-**Rules for handling uncertainty:**
-- If you encounter ambiguous terms, acronyms, or concepts you are unsure about, include them verbatim – do not guess, ignore, or hallucinate. Mention naturally, no need for warnings.
-- You may use context and your trained knowledge, but do not invent missing information.
-- If you cannot determine meaning or importance of summary, err on the side of inclusion.
+Named author papers:
+{author_text}
 
-Candidates:
-{paper_text}"""
+Output format:
+Use the section names as headers (e.g., "Gene Therapy:", "Editing:", "Computation:", "Delivery:"). Then for each, provide the summary. If there are named author papers, add them after the sections with a header "Named Authors:".
+
+Rules:
+- Preserve ambiguous terms verbatim – do not guess or hallucinate.
+- If you cannot determine meaning, err on the side of inclusion.
+- Keep summaries concise and informative.
+
+Return only the final digest text, no extra commentary.
+"""
     payload = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
@@ -153,53 +216,17 @@ Candidates:
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
         resp.raise_for_status()
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        logger.info("DeepSeek response content (first 2000 chars): %s", content[:2000])
-        logger.info("DeepSeek response length: %d characters", len(content))
-        with open("deepseek_response.txt", "w", encoding="utf-8") as f:
-            f.write(content)
-        logger.info("Full DeepSeek response saved to deepseek_response.txt")
-        return content.strip().split("\n")
+        return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"DeepSeek API error: {e}")
-        if hasattr(e, 'response') and e.response:
-            logger.error(f"Response status: {e.response.status_code}")
-            logger.error(f"Response body: {e.response.text[:500]}")
-        return ["⚠️ DeepSeek API error – no summary generated."]
+        logger.error(f"DeepSeek summarization error: {e}")
+        return "⚠️ DeepSeek summarization failed."
 
 # ----------------------------------------------------------------------
-# TELEGRAM – with sanitization
+# TELEGRAM
 # ----------------------------------------------------------------------
-def sanitize_telegram_text(text):
-    """
-    Remove characters that Telegram's API may reject.
-    """
-    # Remove null bytes and other control characters (keep newline, tab, carriage return)
-    # Telegram plain text accepts most printable characters, but some control chars cause 400.
-    # We'll allow: \n, \r, \t, and all printable Unicode.
-    printable = []
-    for ch in text:
-        if ch in ('\n', '\r', '\t') or (ch.isprintable() and ord(ch) >= 32):
-            printable.append(ch)
-        else:
-            # Replace with a space or ignore (we'll ignore)
-            pass
-    cleaned = ''.join(printable)
-    # Replace emoji (🧬) with plain text to be safe
-    cleaned = cleaned.replace('🧬', '(DNA)')
-    # Remove any extra whitespace at start/end
-    return cleaned.strip()
-
 def send_telegram(message):
-    # Sanitize the message
-    message = sanitize_telegram_text(message)
-
-    # If after sanitization the message is empty, use fallback
-    if not message:
-        message = "⚠️ No digest content was generated (sanitized to empty)."
-        logger.warning("Message was empty after sanitization – using fallback.")
-
-    # Split into chunks (max 4000 chars)
+    if not message or not message.strip():
+        message = "⚠️ No digest content was generated."
     max_len = 4000
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for i in range(0, len(message), max_len):
@@ -213,20 +240,12 @@ def send_telegram(message):
             logger.info(f"Telegram chunk {i//max_len + 1} sent.")
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
-            if hasattr(e, 'response') and e.response:
-                logger.error(f"Response status: {e.response.status_code}")
-                logger.error(f"Response body: {e.response.text[:500]}")
-            # Optionally, try sending a smaller fallback message
-            if i == 0:
-                fallback = "⚠️ Telegram delivery failed. Please check the bot token and chat ID."
-                requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": fallback}, timeout=10)
             raise
 
 # ----------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------
 def main():
-    # Skip if DeepSeek peak pricing
     if is_deepseek_peak():
         logger.info("Skipping run – DeepSeek peak pricing window.")
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -235,40 +254,78 @@ def main():
 
     logger.info("Starting daily digest...")
 
-    all_queries = KEYWORDS + AUTHOR_TERMS
-    candidates = []
-    seen_dois = set()
+    now = datetime.now(timezone.utc)
+    start_date = now - timedelta(days=1)
+    end_date = now
 
-    for query in all_queries:
-        logger.info(f"Fetching newest paper for: {query}")
-        paper = fetch_pubmed_top(query)
-        if not paper:
-            logger.info(f"No result for {query}")
-            continue
-        doi = paper.get("doi")
-        if doi in seen_dois:
-            logger.info(f"Duplicate DOI {doi} for {query}, skipping")
-            continue
-        seen_dois.add(doi)
-        candidates.append(paper)
+    # 1. Fetch all papers for each term
+    term_papers = {}
+    for section_name, query in TERMS.items():
+        logger.info(f"Fetching all papers for {section_name}...")
+        pmids = fetch_all_pmids(query, start_date, end_date)
+        logger.info(f"Found {len(pmids)} papers for {section_name}.")
+        if pmids:
+            papers = fetch_metadata(pmids)
+            term_papers[section_name] = papers
+        else:
+            term_papers[section_name] = []
 
-    logger.info(f"Collected {len(candidates)} unique candidates.")
+    # 2. Fetch all papers for named authors
+    author_papers_all = []
+    for author_query in AUTHOR_TERMS:
+        logger.info(f"Fetching all papers for {author_query}...")
+        pmids = fetch_all_pmids(author_query, start_date, end_date)
+        logger.info(f"Found {len(pmids)} papers for {author_query}.")
+        if pmids:
+            papers = fetch_metadata(pmids)
+            author_papers_all.extend(papers)
 
-    if not candidates:
-        send_telegram("No new relevant papers found.")
+    # 3. DeepSeek selection (one call for all sections)
+    selection_response = deepseek_select_titles(term_papers)
+    if not selection_response:
+        send_telegram("⚠️ DeepSeek selection failed – no digest generated.")
         return
 
-    date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    summary_lines = deepseek_summarize(candidates, date_str)
-    final_msg = "\n".join(summary_lines)
+    # Parse the response to extract selected titles per section
+    selected_titles = {}
+    for line in selection_response.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Expected format: "Gene Therapy: <title>"
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if key in TERMS and value.lower() != "no_titles":
+                selected_titles[key] = value
 
-    if not final_msg or not final_msg.strip():
-        final_msg = "⚠️ DeepSeek returned an empty response."
-        logger.warning("Final message was empty – using fallback.")
+    # Match titles to actual paper dicts
+    selected_papers = {}
+    for section_name, title in selected_titles.items():
+        papers = term_papers.get(section_name, [])
+        matched = None
+        for p in papers:
+            if p["title"].strip() == title.strip():
+                matched = p
+                break
+        if not matched:
+            # Case-insensitive fallback
+            for p in papers:
+                if p["title"].strip().lower() == title.strip().lower():
+                    matched = p
+                    break
+        if matched:
+            selected_papers[section_name] = matched
+        else:
+            logger.warning(f"Could not match title '{title}' for {section_name}.")
 
-    logger.info(f"Final message length: {len(final_msg)} chars")
-    send_telegram(final_msg)
+    # 4. Generate summaries via DeepSeek
+    date_str = now.strftime("%B %d, %Y")
+    digest = deepseek_summarize(selected_papers, author_papers_all, date_str)
 
+    # 5. Send to Telegram
+    send_telegram(digest)
     logger.info("Digest sent successfully.")
 
 if __name__ == "__main__":
