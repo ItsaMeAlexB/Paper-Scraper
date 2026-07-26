@@ -7,6 +7,7 @@ import json
 import logging
 import random
 from datetime import datetime, timezone, timedelta
+import zoneinfo
 
 import requests
 from Bio import Entrez, Medline
@@ -32,17 +33,32 @@ KEYWORDS = [
     '(discover* OR engineer*) AND protein',
 ]
 
-# Named authors – as specified (full names)
+# Named authors – full names as specified
 AUTHOR_TERMS = [
     '"David R Liu"[AU]',
     '"Ciaran M Lee"[AU]',
 ]
+
+# DeepSeek peak pricing windows (UTC)
+DEEPSEEK_PEAK_STARTS = [1, 6]   # 1:00–4:00 and 6:00–10:00
+DEEPSEEK_PEAK_ENDS   = [4, 10]
 
 # ----------------------------------------------------------------------
 # LOGGING
 # ----------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# DEEPSEEK PEAK CHECK
+# ----------------------------------------------------------------------
+def is_deepseek_peak():
+    now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
+    for start, end in zip(DEEPSEEK_PEAK_STARTS, DEEPSEEK_PEAK_ENDS):
+        if start <= hour < end:
+            return True
+    return False
 
 # ----------------------------------------------------------------------
 # PUBMED HELPERS
@@ -151,6 +167,13 @@ def send_telegram(message):
 # MAIN
 # ----------------------------------------------------------------------
 def main():
+    # Skip if DeepSeek peak pricing
+    if is_deepseek_peak():
+        logger.info("Skipping run – DeepSeek peak pricing window.")
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            send_telegram("⏳ Daily digest skipped – DeepSeek peak pricing hours.")
+        return
+
     logger.info("Starting daily digest...")
 
     all_queries = KEYWORDS + AUTHOR_TERMS
