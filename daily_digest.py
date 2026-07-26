@@ -46,7 +46,11 @@ DEEPSEEK_PEAK_ENDS   = [4, 10]
 # ----------------------------------------------------------------------
 # LOGGING
 # ----------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
@@ -145,23 +149,52 @@ Candidates:
         "max_tokens": 2500,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-    resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip().split("\n")
+    try:
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        # Log the full response for debugging
+        logger.info("DeepSeek response content (first 2000 chars): %s", content[:2000])
+        logger.info("DeepSeek response length: %d characters", len(content))
+        # Also save to file for full inspection
+        with open("deepseek_response.txt", "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info("Full DeepSeek response saved to deepseek_response.txt")
+        return content.strip().split("\n")
+    except Exception as e:
+        logger.error(f"DeepSeek API error: {e}")
+        if hasattr(e, 'response') and e.response:
+            logger.error(f"Response status: {e.response.status_code}")
+            logger.error(f"Response body: {e.response.text[:500]}")
+        return ["⚠️ DeepSeek API error – no summary generated."]
 
 # ----------------------------------------------------------------------
 # TELEGRAM
 # ----------------------------------------------------------------------
 def send_telegram(message):
-    max_len = 4096
+    # Handle empty or whitespace-only messages
+    if not message or not message.strip():
+        message = "⚠️ No digest content was generated."
+        logger.warning("Message was empty – using fallback.")
+    # Use a safe chunk size
+    max_len = 4000
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for i in range(0, len(message), max_len):
-        chunk = message[i:i+max_len]
+        chunk = message[i:i+max_len].strip()
+        if not chunk:
+            continue
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
-        resp = requests.post(url, json=payload, timeout=30)
-        resp.raise_for_status()
-        logger.info("Telegram chunk sent.")
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
+            resp.raise_for_status()
+            logger.info(f"Telegram chunk {i//max_len + 1} sent.")
+        except Exception as e:
+            logger.error(f"Telegram send error: {e}")
+            if hasattr(e, 'response') and e.response:
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response body: {e.response.text[:500]}")
+            raise
 
 # ----------------------------------------------------------------------
 # MAIN
@@ -202,6 +235,13 @@ def main():
     date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
     summary_lines = deepseek_summarize(candidates, date_str)
     final_msg = "\n".join(summary_lines)
+
+    # Extra safety: if final_msg is empty after join, use fallback
+    if not final_msg or not final_msg.strip():
+        final_msg = "⚠️ DeepSeek returned an empty response."
+        logger.warning("Final message was empty – using fallback.")
+
+    logger.info(f"Final message length: {len(final_msg)} chars")
     send_telegram(final_msg)
 
     logger.info("Digest sent successfully.")
