@@ -40,7 +40,7 @@ AUTHOR_TERMS = [
 ]
 
 # DeepSeek peak pricing windows (UTC)
-DEEPSEEK_PEAK_STARTS = [1, 6]   # 1:00–4:00 and 6:00–10:00
+DEEPSEEK_PEAK_STARTS = [1, 6]
 DEEPSEEK_PEAK_ENDS   = [4, 10]
 
 # ----------------------------------------------------------------------
@@ -154,10 +154,8 @@ Candidates:
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
-        # Log the full response for debugging
         logger.info("DeepSeek response content (first 2000 chars): %s", content[:2000])
         logger.info("DeepSeek response length: %d characters", len(content))
-        # Also save to file for full inspection
         with open("deepseek_response.txt", "w", encoding="utf-8") as f:
             f.write(content)
         logger.info("Full DeepSeek response saved to deepseek_response.txt")
@@ -170,14 +168,38 @@ Candidates:
         return ["⚠️ DeepSeek API error – no summary generated."]
 
 # ----------------------------------------------------------------------
-# TELEGRAM
+# TELEGRAM – with sanitization
 # ----------------------------------------------------------------------
+def sanitize_telegram_text(text):
+    """
+    Remove characters that Telegram's API may reject.
+    """
+    # Remove null bytes and other control characters (keep newline, tab, carriage return)
+    # Telegram plain text accepts most printable characters, but some control chars cause 400.
+    # We'll allow: \n, \r, \t, and all printable Unicode.
+    printable = []
+    for ch in text:
+        if ch in ('\n', '\r', '\t') or (ch.isprintable() and ord(ch) >= 32):
+            printable.append(ch)
+        else:
+            # Replace with a space or ignore (we'll ignore)
+            pass
+    cleaned = ''.join(printable)
+    # Replace emoji (🧬) with plain text to be safe
+    cleaned = cleaned.replace('🧬', '(DNA)')
+    # Remove any extra whitespace at start/end
+    return cleaned.strip()
+
 def send_telegram(message):
-    # Handle empty or whitespace-only messages
-    if not message or not message.strip():
-        message = "⚠️ No digest content was generated."
-        logger.warning("Message was empty – using fallback.")
-    # Use a safe chunk size
+    # Sanitize the message
+    message = sanitize_telegram_text(message)
+
+    # If after sanitization the message is empty, use fallback
+    if not message:
+        message = "⚠️ No digest content was generated (sanitized to empty)."
+        logger.warning("Message was empty after sanitization – using fallback.")
+
+    # Split into chunks (max 4000 chars)
     max_len = 4000
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for i in range(0, len(message), max_len):
@@ -194,6 +216,10 @@ def send_telegram(message):
             if hasattr(e, 'response') and e.response:
                 logger.error(f"Response status: {e.response.status_code}")
                 logger.error(f"Response body: {e.response.text[:500]}")
+            # Optionally, try sending a smaller fallback message
+            if i == 0:
+                fallback = "⚠️ Telegram delivery failed. Please check the bot token and chat ID."
+                requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": fallback}, timeout=10)
             raise
 
 # ----------------------------------------------------------------------
@@ -236,7 +262,6 @@ def main():
     summary_lines = deepseek_summarize(candidates, date_str)
     final_msg = "\n".join(summary_lines)
 
-    # Extra safety: if final_msg is empty after join, use fallback
     if not final_msg or not final_msg.strip():
         final_msg = "⚠️ DeepSeek returned an empty response."
         logger.warning("Final message was empty – using fallback.")
