@@ -116,8 +116,8 @@ def fetch_metadata(pmids):
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def deepseek_select_titles(term_papers):
-    """Single call to select one title per section."""
-    # Build the prompt with all sections and titles
+    """Single call to select one title per section, with logging and fallback."""
+    # Build the prompt
     sections_text = ""
     for section_name, papers in term_papers.items():
         sections_text += f"{section_name}:\n"
@@ -144,6 +144,11 @@ Editing: <exact title>
 Computation: <exact title>
 Delivery: <exact title>
 """
+
+    # Log prompt length
+    prompt_len = len(prompt)
+    logger.info(f"Selection prompt length: {prompt_len} characters (approx {prompt_len//4} tokens)")
+
     payload = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
@@ -151,16 +156,30 @@ Delivery: <exact title>
         "max_tokens": 500,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+
     try:
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         response_text = data["choices"][0]["message"]["content"].strip()
-        logger.info(f"Selection response:\n{response_text}")
+        logger.info(f"Selection response (first 500 chars): {response_text[:500]}")
         return response_text
     except Exception as e:
         logger.error(f"DeepSeek selection error: {e}")
-        return None
+        if hasattr(e, 'response') and e.response:
+            logger.error(f"Response status: {e.response.status_code}")
+            logger.error(f"Response body: {e.response.text[:1000]}")
+        # Fallback: use first title per section
+        logger.warning("Using fallback – first title per section.")
+        selected = {}
+        for section_name, papers in term_papers.items():
+            if papers:
+                selected[section_name] = papers[0]['title']
+            else:
+                selected[section_name] = "NO_TITLES"
+        response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
+        logger.info(f"Fallback selection:\n{response}")
+        return response
 
 def deepseek_summarize(selected_papers, author_papers, date_str):
     section_text = ""
@@ -185,7 +204,7 @@ def deepseek_summarize(selected_papers, author_papers, date_str):
 
 Today is {date_str}.
 
-For each of the following sections, there is a selected paper. Write a summary of 4–6 sentences that captures the key findings, significance, and context. Mention the journal and the lab (last author).
+For each of the following sections, there is a selected paper. Write a summary of 4–6 sentences that captures the key findings, significance, and context.
 
 Sections:
 {section_text}
@@ -196,7 +215,15 @@ Named author papers:
 {author_text}
 
 Output format:
-Use the section names as headers (e.g., "Gene Therapy:", "Editing:", "Computation:", "Delivery:"). Then for each, provide the summary. If there are named author papers, add them after the sections with a header "Named Authors:".
+Use the section names as headers (e.g., "Gene Therapy:", "Editing:", "Computation:", "Delivery:"). For each, provide the journal, DOI, summary, and lab name (last author) in the following format:
+
+Gene Therapy: Journal, DOI, summary, lab name
+Editing: Journal, DOI, summary, lab name
+...
+
+For named authors, use the same format:
+David R Liu: Journal, DOI, summary, lab name
+Ciaran M Lee: Journal, DOI, summary, lab name
 
 Rules:
 - Preserve ambiguous terms verbatim – do not guess or hallucinate.
@@ -283,8 +310,11 @@ def main():
     # 3. DeepSeek selection (one call for all sections)
     selection_response = deepseek_select_titles(term_papers)
     if not selection_response:
+        logger.error("Selection response is empty or None.")
         send_telegram("⚠️ DeepSeek selection failed – no digest generated.")
         return
+
+    logger.info(f"Raw selection response:\n{selection_response}")
 
     # Parse the response to extract selected titles per section
     selected_titles = {}
@@ -292,7 +322,6 @@ def main():
         line = line.strip()
         if not line:
             continue
-        # Expected format: "Gene Therapy: <title>"
         if ":" in line:
             key, value = line.split(":", 1)
             key = key.strip()
@@ -310,7 +339,6 @@ def main():
                 matched = p
                 break
         if not matched:
-            # Case-insensitive fallback
             for p in papers:
                 if p["title"].strip().lower() == title.strip().lower():
                     matched = p
@@ -319,6 +347,13 @@ def main():
             selected_papers[section_name] = matched
         else:
             logger.warning(f"Could not match title '{title}' for {section_name}.")
+
+    # If some sections missing, we can still continue with those we have
+    if not selected_papers:
+        logger.warning("No papers were selected – using first paper per section as fallback.")
+        for section_name, papers in term_papers.items():
+            if papers:
+                selected_papers[section_name] = papers[0]
 
     # 4. Generate summaries via DeepSeek
     date_str = now.strftime("%B %d, %Y")
