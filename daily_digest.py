@@ -20,8 +20,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 
 TERMS = {
-    "Gene Therapy": '"gene therapy" OR "genome therapy" OR "genetic therapy"',
-    "Editing": '"gene edit*" OR "genome edit*" OR "gene engineer*" OR "genome engineer*" OR "genetic edit*" OR "genetic engineer*"',
+    "Gene Therapy": '"gene therapy"',
+    "Editing": '"gene edit*"',
     "Computation": '"computational biology"',
     "Delivery": '"vector"',
 }
@@ -101,6 +101,7 @@ def fetch_metadata(pmids):
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def deepseek_select_titles(term_papers):
+    """Send full selection prompt, log everything."""
     sections_text = ""
     for section_name, papers in term_papers.items():
         sections_text += f"{section_name}:\n"
@@ -128,7 +129,10 @@ Computation: <exact title>
 Delivery: <exact title>
 """
 
-    logger.info(f"Selection prompt length: {len(prompt)} chars")
+    logger.info("=" * 80)
+    logger.info("SELECTION PROMPT SENT TO DEEPSEEK:")
+    logger.info(prompt)
+    logger.info("=" * 80)
 
     payload = {
         "model": "deepseek-v4-flash",
@@ -142,10 +146,16 @@ Delivery: <exact title>
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"Full DeepSeek response: {json.dumps(data, indent=2)[:2000]}")
+        # Log full response
+        logger.info("=" * 80)
+        logger.info("RAW DEEPSEEK SELECTION RESPONSE (FULL JSON):")
+        logger.info(json.dumps(data, indent=2))
+        logger.info("=" * 80)
+
         content = data["choices"][0]["message"]["content"].strip()
         if content:
-            logger.info(f"Selection response:\n{content[:500]}")
+            logger.info("PARSED SELECTION RESPONSE:")
+            logger.info(content)
             return content
         else:
             logger.warning("DeepSeek returned empty content.")
@@ -153,7 +163,7 @@ Delivery: <exact title>
             for section_name, papers in term_papers.items():
                 selected[section_name] = papers[0]['title'] if papers else "NO_TITLES"
             response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
-            logger.info(f"Fallback selection:\n{response}")
+            logger.info(f"FALLBACK SELECTION (first titles):\n{response}")
             return response
     except Exception as e:
         logger.error(f"Selection error: {e}")
@@ -164,7 +174,7 @@ Delivery: <exact title>
         for section_name, papers in term_papers.items():
             selected[section_name] = papers[0]['title'] if papers else "NO_TITLES"
         response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
-        logger.info(f"Fallback selection:\n{response}")
+        logger.info(f"FALLBACK SELECTION (first titles):\n{response}")
         return response
 
 def deepseek_summarize(selected_papers, author_papers, date_str):
@@ -174,6 +184,7 @@ def deepseek_summarize(selected_papers, author_papers, date_str):
             section_text += f"[{section_name}]\n"
             section_text += f"Title: {paper['title']}\n"
             section_text += f"Journal: {paper['journal']}\n"
+            section_text += f"DOI: {paper['doi'] or 'N/A'}\n"
             section_text += f"Authors: {', '.join(paper['authors'][:5])}\n"
             section_text += f"Abstract: {paper['abstract'][:1500]}\n\n"
 
@@ -183,6 +194,7 @@ def deepseek_summarize(selected_papers, author_papers, date_str):
         for paper in author_papers:
             author_text += f"Title: {paper['title']}\n"
             author_text += f"Journal: {paper['journal']}\n"
+            author_text += f"DOI: {paper['doi'] or 'N/A'}\n"
             author_text += f"Authors: {', '.join(paper['authors'][:5])}\n"
             author_text += f"Abstract: {paper['abstract'][:1500]}\n\n"
 
@@ -218,6 +230,11 @@ Rules:
 
 Return only the final digest text, no extra commentary.
 """
+    logger.info("=" * 80)
+    logger.info("SUMMARISATION PROMPT SENT TO DEEPSEEK:")
+    logger.info(prompt)
+    logger.info("=" * 80)
+
     payload = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
@@ -229,6 +246,10 @@ Return only the final digest text, no extra commentary.
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
         resp.raise_for_status()
         data = resp.json()
+        logger.info("=" * 80)
+        logger.info("RAW DEEPSEEK SUMMARISATION RESPONSE (FULL JSON):")
+        logger.info(json.dumps(data, indent=2))
+        logger.info("=" * 80)
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         logger.error(f"DeepSeek summarization error: {e}")
@@ -265,6 +286,7 @@ def main():
     start_date = now - timedelta(days=1)
     end_date = now
 
+    # 1. Fetch all papers for each term
     term_papers = {}
     for section_name, query in TERMS.items():
         logger.info(f"Fetching all papers for {section_name}...")
@@ -275,6 +297,7 @@ def main():
         else:
             term_papers[section_name] = []
 
+    # 2. Fetch all papers for named authors
     author_papers_all = []
     for author_query in AUTHOR_TERMS:
         logger.info(f"Fetching all papers for {author_query}...")
@@ -283,14 +306,18 @@ def main():
         if pmids:
             author_papers_all.extend(fetch_metadata(pmids))
 
+    # 3. DeepSeek selection
     selection_response = deepseek_select_titles(term_papers)
     if not selection_response:
         logger.error("Selection response empty or None.")
         send_telegram("⚠️ DeepSeek selection failed – no digest generated.")
         return
 
-    logger.info(f"Raw selection response:\n{selection_response}")
+    # Log the raw response before parsing
+    logger.info("RAW SELECTION RESPONSE BEFORE PARSING:")
+    logger.info(selection_response)
 
+    # Parse the response to extract selected titles per section
     selected_titles = {}
     for line in selection_response.splitlines():
         line = line.strip()
@@ -303,6 +330,10 @@ def main():
             if key in TERMS and value.lower() != "no_titles":
                 selected_titles[key] = value
 
+    logger.info("PARSED SELECTED TITLES:")
+    logger.info(json.dumps(selected_titles, indent=2))
+
+    # Match titles to actual paper dicts
     selected_papers = {}
     for section_name, title in selected_titles.items():
         papers = term_papers.get(section_name, [])
@@ -321,14 +352,25 @@ def main():
         else:
             logger.warning(f"Could not match title '{title}' for {section_name}.")
 
+    # If no papers selected, fallback to first paper per section
     if not selected_papers:
         logger.warning("No papers were selected – using first paper per section as fallback.")
         for section_name, papers in term_papers.items():
             if papers:
                 selected_papers[section_name] = papers[0]
 
+    logger.info("FINAL SELECTED PAPERS (with metadata):")
+    for section_name, paper in selected_papers.items():
+        logger.info(f"{section_name}: {paper['title']} (DOI: {paper['doi']})")
+
+    # 4. Generate summaries via DeepSeek
     date_str = now.strftime("%B %d, %Y")
     digest = deepseek_summarize(selected_papers, author_papers_all, date_str)
+
+    logger.info("FINAL DIGEST TEXT TO BE SENT TO TELEGRAM:")
+    logger.info(digest)
+
+    # 5. Send to Telegram
     send_telegram(digest)
     logger.info("Digest sent successfully.")
 
