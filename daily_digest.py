@@ -24,7 +24,7 @@ TERMS = {
     "Gene Therapy": '"gene therapy" OR "genome therapy" OR "genetic therapy"',
     "Editing": '"gene edit*" OR "genome edit*" OR "gene engineer*" OR "genome engineer*" OR "genetic edit*" OR "genetic engineer*"',
     "Computation": '"computational biology"',
-    "Delivery": 'delivery OR vector',
+    "Delivery": '"vector"',   # 45 results, much lower than before
 }
 
 # Named authors – full names as specified
@@ -116,19 +116,23 @@ def fetch_metadata(pmids):
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def deepseek_select_titles(term_papers):
-    """Single call to select one title per section, with logging and fallback."""
-    # Build the prompt
-    sections_text = ""
-    for section_name, papers in term_papers.items():
-        sections_text += f"{section_name}:\n"
-        if not papers:
-            sections_text += "NO_TITLES\n\n"
-        else:
-            for i, p in enumerate(papers, 1):
-                sections_text += f"{i}. {p['title']}\n"
-            sections_text += "\n"
+    """
+    Select one title per section. If the combined prompt is > 20k characters,
+    send separate calls per section; otherwise send one call.
+    """
+    # Build prompt for all sections
+    def build_prompt_for_sections(sections):
+        sections_text = ""
+        for section_name, papers in sections.items():
+            sections_text += f"{section_name}:\n"
+            if not papers:
+                sections_text += "NO_TITLES\n\n"
+            else:
+                for i, p in enumerate(papers, 1):
+                    sections_text += f"{i}. {p['title']}\n"
+                sections_text += "\n"
 
-    prompt = f"""For each of the following topics, from the list of titles provided, pick the 1 most useful paper based on its title (e.g. if it's a review it would explain something well), significant (e.g. if it's primary article it has interesting findings), and relevant (e.g. not just an article that mentions gene editing in passing or uses it as a method for investigating an irrelevant topic).
+        prompt = f"""For each of the following topics, from the list of titles provided, pick the 1 most useful paper based on its title (e.g. if it's a review it would explain something well), significant (e.g. if it's primary article it has interesting findings), and relevant (e.g. not just an article that mentions gene editing in passing or uses it as a method for investigating an irrelevant topic).
 
 Return your answer in the exact format below, with one title per topic. Use the exact titles as they appear.
 
@@ -144,19 +148,62 @@ Editing: <exact title>
 Computation: <exact title>
 Delivery: <exact title>
 """
+        return prompt
 
-    # Log prompt length
-    prompt_len = len(prompt)
-    logger.info(f"Selection prompt length: {prompt_len} characters (approx {prompt_len//4} tokens)")
+    combined_prompt = build_prompt_for_sections(term_papers)
+    prompt_len = len(combined_prompt)
+    logger.info(f"Combined selection prompt length: {prompt_len} characters (approx {prompt_len//4} tokens)")
 
+    # If combined prompt is too long, split into separate calls per section
+    if prompt_len > 20000:
+        logger.info("Prompt too long – sending separate calls per section.")
+        selected = {}
+        for section_name, papers in term_papers.items():
+            if not papers:
+                selected[section_name] = "NO_TITLES"
+                continue
+            # Build a small prompt for this section
+            prompt = build_prompt_for_sections({section_name: papers})
+            # The expected format is "section_name: <title>", but we'll just parse the response
+            payload = {
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 200,
+            }
+            headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+            try:
+                resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
+                resp.raise_for_status()
+                data = resp.json()
+                response_text = data["choices"][0]["message"]["content"].strip()
+                logger.info(f"Selection for {section_name}: {response_text[:200]}")
+                # Parse: expects "section_name: title"
+                if ":" in response_text:
+                    _, title = response_text.split(":", 1)
+                    selected[section_name] = title.strip()
+                else:
+                    selected[section_name] = response_text
+            except Exception as e:
+                logger.error(f"Error selecting for {section_name}: {e}")
+                # Fallback: use first title
+                if papers:
+                    selected[section_name] = papers[0]['title']
+                else:
+                    selected[section_name] = "NO_TITLES"
+        # Build aggregated response
+        response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
+        logger.info(f"Aggregated selection response:\n{response}")
+        return response
+
+    # Otherwise, send one combined call
     payload = {
         "model": "deepseek-v4-flash",
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": combined_prompt}],
         "temperature": 0.2,
         "max_tokens": 500,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-
     try:
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
@@ -307,7 +354,7 @@ def main():
             papers = fetch_metadata(pmids)
             author_papers_all.extend(papers)
 
-    # 3. DeepSeek selection (one call for all sections)
+    # 3. DeepSeek selection (one call if small, else split)
     selection_response = deepseek_select_titles(term_papers)
     if not selection_response:
         logger.error("Selection response is empty or None.")
@@ -348,7 +395,7 @@ def main():
         else:
             logger.warning(f"Could not match title '{title}' for {section_name}.")
 
-    # If some sections missing, we can still continue with those we have
+    # If no papers selected, fallback to first paper per section
     if not selected_papers:
         logger.warning("No papers were selected – using first paper per section as fallback.")
         for section_name, papers in term_papers.items():
