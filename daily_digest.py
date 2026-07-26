@@ -138,7 +138,7 @@ Delivery: <exact title>
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 1000,
+        "max_tokens": 2000,   # <--- increased from 1000
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
 
