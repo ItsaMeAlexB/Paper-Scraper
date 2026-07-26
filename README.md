@@ -1,4 +1,4 @@
-This script fetches the newest paper for each predefined search term and author,
+This script fetches the newest paper for each predefined search term and author in Pubmed,
 then uses DeepSeek to select the 5 most significant ones and sends them via Telegram.
 
 Setup
@@ -29,8 +29,8 @@ The script uses the following PubMed queries (all are exact as given):
   (discover* OR engineer*) AND protein
 
 Named Authors (always included if present):
-  "David R. Liu"[AU]
-  "Ciaran M. Lee"[AU]
+  "David R Liu"[AU]
+  "Ciaran M Lee"[AU]
 
 Logic
 -----
@@ -39,6 +39,13 @@ Deduplication is done by DOI across all queries.
 The resulting unique candidates are sent to DeepSeek.
 DeepSeek selects the 5 most useful/significant papers.
 The digest is sent as a plain text message via Telegram (split into chunks if >4096 chars).
+
+Peak Pricing Protection
+-----------------------
+The script checks the current UTC time against DeepSeek's peak windows:
+  1:00–4:00 UTC and 6:00–10:00 UTC.
+If run during a peak window, it exits early and sends a Telegram notification.
+The scheduled GitHub Action runs at 04:15 UTC, which is outside all peak windows.
 
 Output Format
 -------------
