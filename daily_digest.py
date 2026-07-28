@@ -7,6 +7,7 @@ import json
 import logging
 import random
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from Bio import Entrez, Medline
@@ -18,6 +19,16 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
+
+# File to track last successful run (timestamp)
+LAST_RUN_FILE = "/tmp/daily_digest_last_run.txt"
+
+# DeepSeek peak pricing windows in UTC
+# Morning peak: 01:00-04:00 UTC (09:00-12:00 Beijing)
+# Afternoon peak: 06:00-10:00 UTC (14:00-18:00 Beijing)
+PEAK_WINDOWS = [(1, 4), (6, 10)]  # (start_hour, end_hour) inclusive start, exclusive end
+PEAK_BUFFER_MINUTES = 30
+COOLDOWN_HOURS = 12
 
 # Search terms – only original research papers will be kept (authors must exist)
 TERMS = {
@@ -32,19 +43,106 @@ AUTHOR_TERMS = [
     '"Ciaran M Lee"[AU]',
 ]
 
-DEEPSEEK_PEAK_STARTS = [1, 6]
-DEEPSEEK_PEAK_ENDS   = [4, 10]
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-def is_deepseek_peak():
-    now_utc = datetime.now(timezone.utc)
-    hour = now_utc.hour
-    for start, end in zip(DEEPSEEK_PEAK_STARTS, DEEPSEEK_PEAK_ENDS):
+
+# =============================================================================
+# DEEPSEEK PEAK PRICING CHECKS
+# =============================================================================
+
+def is_deepseek_peak_time(dt: datetime) -> bool:
+    """
+    Check if given datetime falls inside DeepSeek peak pricing.
+    Peak windows in UTC: 01:00-04:00 and 06:00-10:00
+    """
+    hour = dt.hour
+    for start, end in PEAK_WINDOWS:
         if start <= hour < end:
             return True
     return False
+
+
+def is_within_buffer_of_peak(dt: datetime, buffer_minutes: int) -> bool:
+    """
+    Check if dt is within buffer_minutes BEFORE peak starts.
+    Returns True if a peak window starts within buffer_minutes.
+    """
+    hour = dt.hour
+    minute = dt.minute
+
+    # Check each peak window start time
+    for start_hour, _ in PEAK_WINDOWS:
+        # Calculate minutes until this peak window starts
+        # Handle the case where peak starts at the same hour but later minute
+        if hour < start_hour:
+            # Peak is later today
+            minutes_until = (start_hour - hour) * 60 - minute
+        elif hour == start_hour:
+            # Peak starts at this hour, at minute 0
+            minutes_until = -minute  # negative if we're past the start
+        else:
+            # Peak was earlier today, check tomorrow's start
+            # We don't need to check this because we only care about the next peak
+            # which will be handled by the main logic
+            continue
+
+        if 0 < minutes_until <= buffer_minutes:
+            return True
+
+    return False
+
+
+def has_run_recently(dt: datetime, cooldown_hours: int) -> tuple[bool, str]:
+    """Check if we've run successfully within the last N hours."""
+    if not os.path.exists(LAST_RUN_FILE):
+        return False, "No previous run found"
+
+    try:
+        with open(LAST_RUN_FILE, "r") as f:
+            last_run_str = f.read().strip()
+        last_run = datetime.fromisoformat(last_run_str)
+    except (ValueError, FileNotFoundError):
+        return False, "Corrupted or missing timestamp file"
+
+    time_since = dt - last_run
+    hours_since = time_since.total_seconds() / 3600.0
+
+    if hours_since < cooldown_hours:
+        return False, f"Last run was {hours_since:.1f}h ago (< {cooldown_hours}h cooldown)"
+
+    return True, f"Cooldown satisfied ({hours_since:.1f}h since last run)"
+
+
+def mark_run(dt: datetime):
+    """Record the timestamp of this successful run."""
+    with open(LAST_RUN_FILE, "w") as f:
+        f.write(dt.isoformat())
+
+
+def should_run() -> tuple[bool, str]:
+    """Determine if the job should run now."""
+    now = datetime.now(timezone.utc)
+
+    # 1. Check cooldown (12 hours)
+    ok, msg = has_run_recently(now, COOLDOWN_HOURS)
+    if not ok:
+        return False, msg
+
+    # 2. Check if currently inside peak
+    if is_deepseek_peak_time(now):
+        return False, f"Inside peak window (UTC {now.strftime('%H:%M')})"
+
+    # 3. Check if within 30-min buffer before peak
+    if is_within_buffer_of_peak(now, PEAK_BUFFER_MINUTES):
+        return False, f"Within {PEAK_BUFFER_MINUTES}min buffer before peak (UTC {now.strftime('%H:%M')})"
+
+    return True, "All checks passed — running now!"
+
+
+# =============================================================================
+# PUBMED FUNCTIONS
+# =============================================================================
 
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
     Entrez.email = ENTREZ_EMAIL
@@ -68,6 +166,7 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
             break
         time.sleep(0.3)
     return pmids
+
 
 def fetch_metadata(pmids):
     """Fetch metadata and filter out papers with no authors (e.g., news, highlights)."""
@@ -106,7 +205,13 @@ def fetch_metadata(pmids):
         })
     return papers
 
+
+# =============================================================================
+# DEEPSEEK API FUNCTIONS
+# =============================================================================
+
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+
 
 def deepseek_select_titles(term_papers):
     """Select one title per section (single call)."""
@@ -167,6 +272,7 @@ Delivery: <exact title>
             selected[section_name] = papers[0]['title'] if papers else "NO_TITLES"
         response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
         return response
+
 
 def deepseek_summarize(selected_papers, author_papers, date_str):
     section_text = ""
@@ -237,6 +343,11 @@ Return only the final digest text, no extra commentary.
         logger.error(f"Summarisation error: {e}")
         return "⚠️ DeepSeek summarisation failed."
 
+
+# =============================================================================
+# TELEGRAM FUNCTIONS
+# =============================================================================
+
 def send_telegram(message):
     if not message or not message.strip():
         message = "⚠️ No digest content was generated."
@@ -255,15 +366,26 @@ def send_telegram(message):
             logger.error(f"Telegram send error: {e}")
             raise
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
-    if is_deepseek_peak():
-        logger.info("Skipping run – DeepSeek peak pricing window.")
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            send_telegram("⏳ Daily digest skipped – DeepSeek peak pricing hours.")
+    # Check if we should run
+    ok, reason = should_run()
+    now = datetime.now(timezone.utc)
+    logger.info(f"Current UTC time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if not ok:
+        logger.info(f"Skipping run: {reason}")
+        # Optional: Send a Telegram notification about the skip (only once per day)
+        # Commented out to avoid spam — uncomment if you want notifications
+        # if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        #     send_telegram(f"⏳ Daily digest skipped: {reason}")
         return
 
     logger.info("Starting daily digest...")
-    now = datetime.now(timezone.utc)
     start_date = now - timedelta(days=1)
     end_date = now
 
@@ -340,6 +462,11 @@ def main():
     digest = deepseek_summarize(selected_papers, author_papers_all, date_str)
     send_telegram(digest)
     logger.info("Digest sent successfully.")
+
+    # Mark this run as successful (only after everything completes)
+    mark_run(now)
+    logger.info(f"Marked successful run at {now.isoformat()}")
+
 
 if __name__ == "__main__":
     main()
