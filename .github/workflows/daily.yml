@@ -1,8 +1,11 @@
 name: Daily Digest
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: '15 4 * * *'   # 04:15 UTC daily
+    # Runs at 23:15, 00:15, 01:15, 02:15, 03:15, 04:15, 05:15, 06:15, 07:15 UTC
+    # This gives 9 attempts to find an off-peak window
+    - cron: '15 23,0-7 * * *'
 
 jobs:
   run:
