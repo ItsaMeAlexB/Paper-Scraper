@@ -93,17 +93,21 @@ def is_within_buffer_of_peak(dt: datetime, buffer_minutes: int) -> bool:
     return False
 
 
-def has_run_recently(dt: datetime, cooldown_hours: int) -> tuple[bool, str]:
-    """Check if we've run successfully within the last N hours."""
+def is_cooldown_satisfied(dt: datetime, cooldown_hours: int) -> tuple[bool, str]:
+    """
+    Check if cooldown is satisfied.
+    Returns (True, reason) if we can run from cooldown perspective.
+    This means: no previous run OR last run was > cooldown_hours ago.
+    """
     if not os.path.exists(LAST_RUN_FILE):
-        return False, "No previous run found"
+        return True, "No previous run – first run allowed"
 
     try:
         with open(LAST_RUN_FILE, "r") as f:
             last_run_str = f.read().strip()
         last_run = datetime.fromisoformat(last_run_str)
     except (ValueError, FileNotFoundError):
-        return False, "Corrupted or missing timestamp file"
+        return True, "Corrupted timestamp file – treating as no previous run"
 
     time_since = dt - last_run
     hours_since = time_since.total_seconds() / 3600.0
@@ -124,16 +128,15 @@ def should_run() -> tuple[bool, str]:
     """Determine if the job should run now."""
     now = datetime.now(timezone.utc)
 
-    # 1. Check cooldown (12 hours)
-    ok, msg = has_run_recently(now, COOLDOWN_HOURS)
+    # 1. Check cooldown (12 hours) – first run is allowed
+    ok, msg = is_cooldown_satisfied(now, COOLDOWN_HOURS)
     if not ok:
         return False, msg
 
-    # 2. Check if currently inside peak
+    # 2. Check if currently inside peak window (with buffer)
+    # Avoid 00:30–04:00 and 05:30–10:00 UTC
     if is_deepseek_peak_time(now):
         return False, f"Inside peak window (UTC {now.strftime('%H:%M')})"
-
-    # 3. Check if within 30-min buffer before peak
     if is_within_buffer_of_peak(now, PEAK_BUFFER_MINUTES):
         return False, f"Within {PEAK_BUFFER_MINUTES}min buffer before peak (UTC {now.strftime('%H:%M')})"
 
@@ -379,10 +382,7 @@ def main():
 
     if not ok:
         logger.info(f"Skipping run: {reason}")
-        # Optional: Send a Telegram notification about the skip (only once per day)
-        # Commented out to avoid spam — uncomment if you want notifications
-        # if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        #     send_telegram(f"⏳ Daily digest skipped: {reason}")
+        # No Telegram message sent – only log to avoid spam
         return
 
     logger.info("Starting daily digest...")
