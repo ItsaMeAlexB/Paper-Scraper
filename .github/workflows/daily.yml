@@ -1,32 +1,40 @@
 name: Daily Digest
-
 on:
   workflow_dispatch:
   schedule:
     # Runs at 23:15, 00:15, 01:15, 02:15, 03:15, 04:15, 05:15, 06:15, 07:15 UTC
-    # This gives 9 attempts to find an off-peak window
     - cron: '15 23,0-7 * * *'
-
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Cache pip packages
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
       - run: pip install -r requirements.txt
-      - name: Run digest
+      - name: Run daily digest
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
+          APIFY_API: ${{ secrets.APIFY_API }}
+          DAILY_MODE: daily
         run: python daily_digest.py
+      - name: Commit and push updated queue
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add weekly_queue.json last_sent_date.txt 2>/dev/null || true
+          git commit -m "Update queue after daily send [skip ci]" || echo "No changes"
+          git push
