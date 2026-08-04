@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from Bio import Entrez, Medline
+from apify_client import ApifyClient
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
@@ -19,132 +20,85 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
+APIFY_API_KEY = os.environ.get("APIFY_API")   # secret name is APIFY_API
 
-# File to track last successful run (timestamp)
-LAST_RUN_FILE = "/tmp/daily_digest_last_run.txt"
+# Mode: "weekly" or "daily" – set via environment variable
+MODE = os.environ.get("DAILY_MODE", "daily").lower()
 
-# DeepSeek peak pricing windows in UTC
-# Morning peak: 01:00-04:00 UTC (09:00-12:00 Beijing)
-# Afternoon peak: 06:00-10:00 UTC (14:00-18:00 Beijing)
-PEAK_WINDOWS = [(1, 4), (6, 10)]  # (start_hour, end_hour) inclusive start, exclusive end
+# File to track queue for daily consumption (built weekly)
+QUEUE_FILE = "weekly_queue.json"
+LAST_SENT_FILE = "last_sent_date.txt"
+
+# DeepSeek peak pricing windows in UTC (same as before)
+PEAK_WINDOWS = [(1, 4), (6, 10)]
 PEAK_BUFFER_MINUTES = 30
-COOLDOWN_HOURS = 12
 
-# Search terms – only original research papers will be kept (authors must exist)
+# Search terms – we now have 7
 TERMS = {
+    "Gene Editing": '"gene editing"',
+    "Genome Engineering": '"genome engineering"',
+    "Vectors": '"viral vector" OR "non-viral vector"',
     "Gene Therapy": '"gene therapy"',
-    "Editing": '"gene edit*"',
-    "Computation": '"computational biology"',
-    "Delivery": '"vector"',
+    "Computational Biology": '"computational biology"',
+    "Gene Delivery": '"gene delivery"',
+    "Cell Therapy": '"cell therapy"',
 }
 
+# Named authors (always included if they published in the week)
 AUTHOR_TERMS = [
     '"David R Liu"[AU]',
     '"Ciaran M Lee"[AU]',
 ]
 
+# Subreddits to scrape
+SUBREDDITS = [
+    "bioinformatics",
+    "labrats",
+    "biotech",
+    "molecularbiology",
+    "biochemistry",
+    "CRISPR",
+    "ClinTrials",
+]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-
 # =============================================================================
-# DEEPSEEK PEAK PRICING CHECKS
+# DEEPSEEK PEAK PRICING CHECKS (unchanged)
 # =============================================================================
 
 def is_deepseek_peak_time(dt: datetime) -> bool:
-    """
-    Check if given datetime falls inside DeepSeek peak pricing.
-    Peak windows in UTC: 01:00-04:00 and 06:00-10:00
-    """
     hour = dt.hour
     for start, end in PEAK_WINDOWS:
         if start <= hour < end:
             return True
     return False
 
-
 def is_within_buffer_of_peak(dt: datetime, buffer_minutes: int) -> bool:
-    """
-    Check if dt is within buffer_minutes BEFORE peak starts.
-    Returns True if a peak window starts within buffer_minutes.
-    """
     hour = dt.hour
     minute = dt.minute
-
-    # Check each peak window start time
     for start_hour, _ in PEAK_WINDOWS:
-        # Calculate minutes until this peak window starts
-        # Handle the case where peak starts at the same hour but later minute
         if hour < start_hour:
-            # Peak is later today
             minutes_until = (start_hour - hour) * 60 - minute
         elif hour == start_hour:
-            # Peak starts at this hour, at minute 0
-            minutes_until = -minute  # negative if we're past the start
+            minutes_until = -minute
         else:
-            # Peak was earlier today, check tomorrow's start
-            # We don't need to check this because we only care about the next peak
-            # which will be handled by the main logic
             continue
-
         if 0 < minutes_until <= buffer_minutes:
             return True
-
     return False
 
-
-def is_cooldown_satisfied(dt: datetime, cooldown_hours: int) -> tuple[bool, str]:
-    """
-    Check if cooldown is satisfied.
-    Returns (True, reason) if we can run from cooldown perspective.
-    This means: no previous run OR last run was > cooldown_hours ago.
-    """
-    if not os.path.exists(LAST_RUN_FILE):
-        return True, "No previous run – first run allowed"
-
-    try:
-        with open(LAST_RUN_FILE, "r") as f:
-            last_run_str = f.read().strip()
-        last_run = datetime.fromisoformat(last_run_str)
-    except (ValueError, FileNotFoundError):
-        return True, "Corrupted timestamp file – treating as no previous run"
-
-    time_since = dt - last_run
-    hours_since = time_since.total_seconds() / 3600.0
-
-    if hours_since < cooldown_hours:
-        return False, f"Last run was {hours_since:.1f}h ago (< {cooldown_hours}h cooldown)"
-
-    return True, f"Cooldown satisfied ({hours_since:.1f}h since last run)"
-
-
-def mark_run(dt: datetime):
-    """Record the timestamp of this successful run."""
-    with open(LAST_RUN_FILE, "w") as f:
-        f.write(dt.isoformat())
-
-
 def should_run() -> tuple[bool, str]:
-    """Determine if the job should run now."""
     now = datetime.now(timezone.utc)
-
-    # 1. Check cooldown (12 hours) – first run is allowed
-    ok, msg = is_cooldown_satisfied(now, COOLDOWN_HOURS)
-    if not ok:
-        return False, msg
-
-    # 2. Check if currently inside peak window (with buffer)
-    # Avoid 00:30–04:00 and 05:30–10:00 UTC
     if is_deepseek_peak_time(now):
         return False, f"Inside peak window (UTC {now.strftime('%H:%M')})"
     if is_within_buffer_of_peak(now, PEAK_BUFFER_MINUTES):
         return False, f"Within {PEAK_BUFFER_MINUTES}min buffer before peak (UTC {now.strftime('%H:%M')})"
-
     return True, "All checks passed — running now!"
 
-
 # =============================================================================
-# PUBMED FUNCTIONS
+# PUBMED FUNCTIONS (unchanged)
 # =============================================================================
 
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
@@ -170,9 +124,7 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
         time.sleep(0.3)
     return pmids
 
-
 def fetch_metadata(pmids):
-    """Fetch metadata and filter out papers with no authors (e.g., news, highlights)."""
     if not pmids:
         return []
     Entrez.email = ENTREZ_EMAIL
@@ -188,10 +140,8 @@ def fetch_metadata(pmids):
     papers = []
     for rec in records:
         authors = rec.get("AU", [])
-        # Skip if no authors (likely news, highlights, editorials)
         if not authors:
             continue
-
         doi = None
         for id_ in rec.get("AID", []):
             if id_.endswith(" [doi]"):
@@ -208,16 +158,13 @@ def fetch_metadata(pmids):
         })
     return papers
 
-
 # =============================================================================
 # DEEPSEEK API FUNCTIONS
 # =============================================================================
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-
 def deepseek_select_titles(term_papers):
-    """Select one title per section (single call)."""
     sections_text = ""
     for section_name, papers in term_papers.items():
         sections_text += f"{section_name}:\n"
@@ -239,12 +186,14 @@ Topics and titles:
 If the list is empty, return "NO_TITLES".
 
 Format:
+Gene Editing: <exact title>
+Genome Engineering: <exact title>
+Vectors: <exact title>
 Gene Therapy: <exact title>
-Editing: <exact title>
-Computation: <exact title>
-Delivery: <exact title>
+Computational Biology: <exact title>
+Gene Delivery: <exact title>
+Cell Therapy: <exact title>
 """
-
     payload = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
@@ -261,7 +210,7 @@ Delivery: <exact title>
         if content:
             return content
         else:
-            logger.warning("DeepSeek returned empty content – using fallback (first titles).")
+            logger.warning("DeepSeek returned empty content – using fallback.")
             selected = {}
             for section_name, papers in term_papers.items():
                 selected[section_name] = papers[0]['title'] if papers else "NO_TITLES"
@@ -269,86 +218,112 @@ Delivery: <exact title>
             return response
     except Exception as e:
         logger.error(f"Selection error: {e}")
-        # Fallback to first titles
         selected = {}
         for section_name, papers in term_papers.items():
             selected[section_name] = papers[0]['title'] if papers else "NO_TITLES"
         response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
         return response
 
+def deepseek_summarize_single(title, abstract, journal, doi, authors, item_type="paper"):
+    prompt = f"""You are a scientific summariser. Write a concise 5‑sentence summary of the following {item_type}.
 
-def deepseek_summarize(selected_papers, author_papers, date_str):
-    section_text = ""
-    for section_name, paper in selected_papers.items():
-        if paper:
-            section_text += f"[{section_name}]\n"
-            section_text += f"Title: {paper['title']}\n"
-            section_text += f"Journal: {paper['journal']}\n"
-            section_text += f"DOI: {paper['doi'] or 'N/A'}\n"
-            section_text += f"Authors: {', '.join(paper['authors'][:5])}\n"
-            section_text += f"Abstract: {paper['abstract'][:1500]}\n\n"
-
-    author_text = ""
-    if author_papers:
-        author_text = "[Named Authors]\n"
-        for paper in author_papers:
-            author_text += f"Title: {paper['title']}\n"
-            author_text += f"Journal: {paper['journal']}\n"
-            author_text += f"DOI: {paper['doi'] or 'N/A'}\n"
-            author_text += f"Authors: {', '.join(paper['authors'][:5])}\n"
-            author_text += f"Abstract: {paper['abstract'][:1500]}\n\n"
-
-    prompt = f"""You are a scientific summariser. Your task is to produce a daily digest.
-
-Today is {date_str}.
-
-For each of the following sections, there is a selected paper. Write a summary of 4–6 sentences that captures the key findings, significance, and context.
-
-Sections:
-{section_text}
-
-Additionally, if any papers from named authors (David R. Liu or Ciaran M. Lee) are provided, write a separate summary for each (same length) as extra paragraphs.
-
-Named author papers:
-{author_text}
-
-Output format:
-Use the section names as headers (e.g., "Gene Therapy:", "Editing:", "Computation:", "Delivery:"). For each, provide the journal, DOI, summary, and lab name (last author) in the following format:
-
-Gene Therapy: Journal, DOI, summary, lab name
-Editing: Journal, DOI, summary, lab name
-...
-
-For named authors, use the same format:
-David R Liu: Journal, DOI, summary, lab name
-Ciaran M Lee: Journal, DOI, summary, lab name
+{item_type.capitalize()} details:
+Title: {title}
+Journal: {journal}
+DOI: {doi}
+Authors: {', '.join(authors[:5])}
+Abstract: {abstract[:1500]}
 
 Rules:
-- Preserve ambiguous terms verbatim – do not guess or hallucinate.
+- Provide exactly 5 sentences.
+- Capture key findings, significance, and context.
+- Preserve ambiguous terms verbatim – do not guess.
 - If you cannot determine meaning, err on the side of inclusion.
-- Keep summaries concise and informative.
-
-Return only the final digest text, no extra commentary.
+- Output only the summary text, nothing else.
 """
     payload = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 2500,
+        "max_tokens": 500,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
     try:
-        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=90)
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         logger.error(f"Summarisation error: {e}")
-        return "⚠️ DeepSeek summarisation failed."
-
+        return "⚠️ Summary generation failed."
 
 # =============================================================================
-# TELEGRAM FUNCTIONS
+# SUBREDDIT FETCH (via Apify)
+# =============================================================================
+
+def fetch_top_reddit_posts(subreddits, max_items=7):
+    if not APIFY_API_KEY:
+        logger.error("APIFY_API secret not set – cannot fetch Reddit posts.")
+        return []
+    client = ApifyClient(APIFY_API_KEY)
+    start_urls = [{"url": f"https://www.reddit.com/r/{sub}/top/?t=week"} for sub in subreddits]
+    run_input = {
+        "startUrls": start_urls,
+        "maxItems": max_items,
+        "includeMediaLinks": True,
+        "proxy": {"useApifyProxy": True}
+    }
+    try:
+        run = client.actor("trudax/reddit-scraper-lite").call(run_input=run_input)
+        items = []
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            if item.get("dataType") == "post":
+                items.append(item)
+        # Sort by upVotes descending
+        items.sort(key=lambda x: x.get("upVotes", 0), reverse=True)
+        return items[:max_items]
+    except Exception as e:
+        logger.error(f"Apify error: {e}")
+        return []
+
+# =============================================================================
+# QUEUE MANAGEMENT
+# =============================================================================
+
+def load_queue():
+    if os.path.exists(QUEUE_FILE):
+        try:
+            with open(QUEUE_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("entries", [])
+        except (json.JSONDecodeError, IOError):
+            logger.warning("Could not load queue file, starting fresh.")
+            return []
+    return []
+
+def save_queue(entries):
+    data = {"week_start": datetime.now(timezone.utc).isoformat(), "entries": entries}
+    with open(QUEUE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def has_sent_today():
+    if not os.path.exists(LAST_SENT_FILE):
+        return False
+    try:
+        with open(LAST_SENT_FILE, "r") as f:
+            last_date = f.read().strip()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return last_date == today
+    except:
+        return False
+
+def mark_sent_today():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with open(LAST_SENT_FILE, "w") as f:
+        f.write(today)
+
+# =============================================================================
+# TELEGRAM FUNCTIONS (unchanged)
 # =============================================================================
 
 def send_telegram(message):
@@ -369,26 +344,21 @@ def send_telegram(message):
             logger.error(f"Telegram send error: {e}")
             raise
 
-
 # =============================================================================
-# MAIN
+# WEEKLY BUILD
 # =============================================================================
 
-def main():
-    # Check if we should run
-    ok, reason = should_run()
+def build_weekly_queue():
     now = datetime.now(timezone.utc)
-    logger.info(f"Current UTC time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    if not ok:
-        logger.info(f"Skipping run: {reason}")
-        # No Telegram message sent – only log to avoid spam
-        return
-
-    logger.info("Starting daily digest...")
-    start_date = now - timedelta(days=1)
+    start_date = now - timedelta(days=7)
     end_date = now
 
+    # 1. Fetch subreddit posts
+    logger.info("Fetching top weekly posts from subreddits...")
+    reddit_posts = fetch_top_reddit_posts(SUBREDDITS, len(SUBREDDITS))
+    logger.info(f"Got {len(reddit_posts)} subreddit posts.")
+
+    # 2. Fetch PubMed papers per term
     term_papers = {}
     for section_name, query in TERMS.items():
         logger.info(f"Fetching papers for {section_name}...")
@@ -401,72 +371,266 @@ def main():
         else:
             term_papers[section_name] = []
 
-    author_papers_all = []
+    # 3. Deduplicate across search terms by DOI/PMID (keep only unique papers)
+    all_papers = []
+    seen_ids = set()
+    for section, papers in term_papers.items():
+        for p in papers:
+            key = p.get("doi") or p.get("pmid")
+            if key and key not in seen_ids:
+                seen_ids.add(key)
+                all_papers.append(p)
+            elif not key:
+                # If no DOI/PMID, still keep but may duplicate – we'll rely on title
+                # For safety, add anyway; dedup later by title
+                all_papers.append(p)
+
+    # Remove duplicates by title (case insensitive)
+    unique_by_title = {}
+    for p in all_papers:
+        title = p["title"].strip().lower()
+        if title not in unique_by_title:
+            unique_by_title[title] = p
+    all_papers = list(unique_by_title.values())
+
+    logger.info(f"After deduplication: {len(all_papers)} unique papers.")
+
+    # 4. Select one per term using DeepSeek (from original term_papers – but we need to run selection on the original grouped lists)
+    # We'll run selection on term_papers (already grouped), then map selected titles to the deduplicated paper list.
+    selection_response = deepseek_select_titles(term_papers)
+    selected_titles = {}
+    for line in selection_response.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in TERMS and value.lower() != "no_titles":
+            selected_titles[key] = value
+
+    # For each term, find the paper in the deduplicated list that matches the title
+    term_picked_papers = {}
+    for term, title in selected_titles.items():
+        matched = None
+        for p in all_papers:
+            if p["title"].strip().lower() == title.lower():
+                matched = p
+                break
+        if matched:
+            term_picked_papers[term] = matched
+        else:
+            # Fallback: take first paper from the original term list (if any)
+            if term_papers.get(term):
+                term_picked_papers[term] = term_papers[term][0]
+            else:
+                term_picked_papers[term] = None
+
+    # 5. Fetch named author papers (if any from last 7 days)
+    author_papers = []
     for author_query in AUTHOR_TERMS:
         logger.info(f"Fetching papers for {author_query}...")
         pmids = fetch_all_pmids(author_query, start_date, end_date)
-        logger.info(f"Found {len(pmids)} raw results.")
         if pmids:
             papers = fetch_metadata(pmids)
-            logger.info(f"Kept {len(papers)} papers (with authors).")
-            author_papers_all.extend(papers)
+            author_papers.extend(papers)
 
-    # Selection
-    selection_response = deepseek_select_titles(term_papers)
-    if not selection_response:
-        logger.error("Selection failed – using fallback.")
-        selected_papers = {}
-        for section_name, papers in term_papers.items():
-            if papers:
-                selected_papers[section_name] = papers[0]
+    # Deduplicate author papers against already selected
+    selected_dois = {p.get("doi") for p in term_picked_papers.values() if p and p.get("doi")}
+    selected_pmids = {p.get("pmid") for p in term_picked_papers.values() if p and p.get("pmid")}
+    unique_author_papers = []
+    for p in author_papers:
+        key = p.get("doi") or p.get("pmid")
+        if key and key not in selected_dois and key not in selected_pmids:
+            unique_author_papers.append(p)
+        elif not key:
+            # Check by title
+            title = p["title"].strip().lower()
+            if title not in {ap["title"].strip().lower() for ap in term_picked_papers.values() if ap}:
+                unique_author_papers.append(p)
+
+    # 6. Build queue entries
+    entries = []
+    # Add one entry per term paper (only if we have a subreddit post)
+    # Distribute named author papers evenly
+    all_papers = [p for p in term_picked_papers.values() if p is not None] + unique_author_papers
+    # Shuffle to avoid always same order? No, we want predictable: term papers first, then author papers.
+    # Create list of (type, paper) tuples.
+    paper_items = [("term", p) for p in term_picked_papers.values() if p is not None]
+    # Add author papers as separate entries
+    for p in unique_author_papers:
+        paper_items.append(("author", p))
+
+    # Ensure we have at least one subreddit post per daily entry
+    # We want each day to have 1 subreddit post + 1 paper (if available).
+    # If we have more papers than subreddit posts, we'll distribute them across days.
+    if not reddit_posts:
+        logger.warning("No subreddit posts fetched, using dummy placeholder.")
+        reddit_posts = [{"title": "No top post found", "body": "", "url": "", "upVotes": 0}]
+
+    # We'll create entries by zipping reddit_posts with paper_items, cycling reddit_posts if more papers than posts.
+    import itertools
+    reddit_cycle = itertools.cycle(reddit_posts)
+    for paper in paper_items:
+        post = next(reddit_cycle)
+        entries.append({
+            "type": "daily",
+            "subreddit_post": post,
+            "paper": paper[1],  # paper dict
+            "paper_type": paper[0]  # "term" or "author"
+        })
+
+    # If there are extra reddit posts without papers, we add them as standalone? But we want to include all 7 subreddits, so we need to ensure all posts are included.
+    # Better: create an entry for each subreddit post, and if no paper, still include it.
+    # Let's reconstruct: we want one daily entry per subreddit post, with paper from the list if available.
+    paper_idx = 0
+    final_entries = []
+    for post in reddit_posts:
+        # if there are papers left, assign one
+        if paper_idx < len(paper_items):
+            paper = paper_items[paper_idx][1]
+            paper_type = paper_items[paper_idx][0]
+            paper_idx += 1
+        else:
+            paper = None
+            paper_type = None
+        final_entries.append({
+            "type": "daily",
+            "subreddit_post": post,
+            "paper": paper,
+            "paper_type": paper_type
+        })
+
+    # If there are remaining papers after all posts, we can attach them to the first entries (or create extra entries).
+    # To keep simple, we'll distribute extra papers to the first few entries (each getting an extra paper entry).
+    # That means some days will have 2 papers, 1 subreddit post.
+    # We'll create a new list where each entry is a list of papers.
+    entries_with_papers = []
+    for i, post in enumerate(reddit_posts):
+        entry_papers = []
+        # Assign the first paper to this post if index < len(paper_items)
+        if i < len(paper_items):
+            entry_papers.append(paper_items[i])
+        # If we have more papers than posts, we'll add extra to the first entries
+        # We'll handle after building the base
+        entries_with_papers.append({"subreddit_post": post, "papers": entry_papers})
+
+    # Add remaining papers (if any) to the first entries in a round-robin fashion
+    extra_papers = paper_items[len(reddit_posts):]
+    for idx, paper in enumerate(extra_papers):
+        target_idx = idx % len(entries_with_papers)
+        entries_with_papers[target_idx]["papers"].append(paper)
+
+    # Now convert to the final queue entries
+    final_queue = []
+    for entry in entries_with_papers:
+        # There will be at least one paper? Possibly none if no papers at all.
+        # We'll create one daily digest item per entry; it can have 0,1,2 papers.
+        final_queue.append({
+            "subreddit_post": entry["subreddit_post"],
+            "papers": entry["papers"]  # list of (type, paper) tuples
+        })
+
+    # If no papers at all, we can still send subreddit posts only.
+    # But we want to send 7 days. We'll just send each subreddit post with its assigned papers (could be empty).
+
+    # Save queue
+    save_queue(final_queue)
+    logger.info(f"Built weekly queue with {len(final_queue)} daily entries.")
+
+# =============================================================================
+# DAILY SEND
+# =============================================================================
+
+def send_daily_digest():
+    # Check if already sent today
+    if has_sent_today():
+        logger.info("Already sent today – skipping.")
+        return
+
+    # Load queue
+    entries = load_queue()
+    if not entries:
+        logger.info("Queue is empty – no digest to send.")
+        return
+
+    # Pop first entry
+    entry = entries.pop(0)
+    subreddit_post = entry.get("subreddit_post")
+    papers = entry.get("papers", [])  # list of (type, paper) tuples
+
+    # Build digest text
+    digest_parts = []
+
+    # Subreddit post section
+    if subreddit_post:
+        title = subreddit_post.get("title", "No title")
+        body = subreddit_post.get("body", "")
+        url = subreddit_post.get("url", "")
+        upvotes = subreddit_post.get("upVotes", 0)
+        # Summarize subreddit post using DeepSeek (5 sentences)
+        summary = deepseek_summarize_single(
+            title=title,
+            abstract=body[:1500],
+            journal="Reddit",
+            doi="",
+            authors=[],
+            item_type="subreddit post"
+        )
+        digest_parts.append(f"Reddit Post: {title}\nURL: {url}\nUpvotes: {upvotes}\nSummary: {summary}\n")
+
+    # Papers
+    for paper_type, paper in papers:
+        if not paper:
+            continue
+        # Determine header
+        if paper_type == "author":
+            header = f"Named Author: {', '.join(paper['authors'][:2])}"
+        else:
+            header = "Selected Paper"
+        summary = deepseek_summarize_single(
+            title=paper["title"],
+            abstract=paper["abstract"],
+            journal=paper["journal"],
+            doi=paper["doi"] or "N/A",
+            authors=paper["authors"],
+            item_type="paper"
+        )
+        digest_parts.append(f"{header}: Journal: {paper['journal']}, DOI: {paper['doi'] or 'N/A'}, Summary: {summary}\n")
+
+    full_message = "\n".join(digest_parts)
+    if not full_message.strip():
+        full_message = "No content available for today."
+
+    # Send via Telegram
+    send_telegram(full_message)
+
+    # Mark sent today
+    mark_sent_today()
+
+    # Save updated queue
+    save_queue(entries)
+    logger.info("Daily digest sent and queue updated.")
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    # Check peak pricing for both modes
+    ok, reason = should_run()
+    now = datetime.now(timezone.utc)
+    logger.info(f"Current UTC time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    if not ok:
+        logger.info(f"Skipping run: {reason}")
+        return
+
+    if MODE == "weekly":
+        logger.info("Running weekly build mode...")
+        build_weekly_queue()
     else:
-        # Parse selection response
-        selected_titles = {}
-        for line in selection_response.splitlines():
-            line = line.strip()
-            if not line or ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if key in TERMS and value.lower() != "no_titles":
-                selected_titles[key] = value
-
-        # Match titles to papers
-        selected_papers = {}
-        for section_name, title in selected_titles.items():
-            papers = term_papers.get(section_name, [])
-            matched = None
-            for p in papers:
-                if p["title"].strip() == title.strip():
-                    matched = p
-                    break
-            if not matched:
-                # Case-insensitive fallback
-                for p in papers:
-                    if p["title"].strip().lower() == title.strip().lower():
-                        matched = p
-                        break
-            if matched:
-                selected_papers[section_name] = matched
-            else:
-                logger.warning(f"Could not match title '{title}' for {section_name}.")
-
-        # If any section missing, fallback to first paper
-        for section_name in TERMS:
-            if section_name not in selected_papers and term_papers.get(section_name):
-                selected_papers[section_name] = term_papers[section_name][0]
-
-    # Summarise
-    date_str = now.strftime("%B %d, %Y")
-    digest = deepseek_summarize(selected_papers, author_papers_all, date_str)
-    send_telegram(digest)
-    logger.info("Digest sent successfully.")
-
-    # Mark this run as successful (only after everything completes)
-    mark_run(now)
-    logger.info(f"Marked successful run at {now.isoformat()}")
-
+        logger.info("Running daily send mode...")
+        send_daily_digest()
 
 if __name__ == "__main__":
     main()
