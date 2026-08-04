@@ -7,7 +7,6 @@ import json
 import logging
 import random
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 
 import requests
 from Bio import Entrez, Medline
@@ -258,33 +257,36 @@ Rules:
         return "⚠️ Summary generation failed."
 
 # =============================================================================
-# SUBREDDIT FETCH (via Apify)
+# SUBREDDIT FETCH (via Apify) – FIXED: one call per subreddit
 # =============================================================================
 
-def fetch_top_reddit_posts(subreddits, max_items=7):
+def fetch_top_reddit_posts(subreddits):
+    """Fetch exactly one top weekly post per subreddit."""
     if not APIFY_API_KEY:
         logger.error("APIFY_API secret not set – cannot fetch Reddit posts.")
         return []
     client = ApifyClient(APIFY_API_KEY)
-    start_urls = [{"url": f"https://www.reddit.com/r/{sub}/top/?t=week"} for sub in subreddits]
-    run_input = {
-        "startUrls": start_urls,
-        "maxItems": max_items,
-        "includeMediaLinks": True,
-        "proxy": {"useApifyProxy": True}
-    }
-    try:
-        run = client.actor("trudax/reddit-scraper-lite").call(run_input=run_input)
-        items = []
-        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-            if item.get("dataType") == "post":
-                items.append(item)
-        # Sort by upVotes descending
-        items.sort(key=lambda x: x.get("upVotes", 0), reverse=True)
-        return items[:max_items]
-    except Exception as e:
-        logger.error(f"Apify error: {e}")
-        return []
+    posts = []
+    for sub in subreddits:
+        url = f"https://www.reddit.com/r/{sub}/top/?t=week"
+        run_input = {
+            "startUrls": [{"url": url}],
+            "maxItems": 1,
+            "includeMediaLinks": True,
+            "proxy": {"useApifyProxy": True}
+        }
+        try:
+            run = client.actor("trudax/reddit-scraper-lite").call(run_input=run_input)
+            for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+                if item.get("dataType") == "post":
+                    posts.append(item)
+                    break  # only one per subreddit
+        except Exception as e:
+            logger.error(f"Apify error for {sub}: {e}")
+        time.sleep(0.5)  # be gentle to the API
+    # Sort all collected posts by upVotes (though we already have one per sub)
+    posts.sort(key=lambda x: x.get("upVotes", 0), reverse=True)
+    return posts
 
 # =============================================================================
 # QUEUE MANAGEMENT
@@ -353,9 +355,9 @@ def build_weekly_queue():
     start_date = now - timedelta(days=7)
     end_date = now
 
-    # 1. Fetch subreddit posts
+    # 1. Fetch subreddit posts – one per subreddit
     logger.info("Fetching top weekly posts from subreddits...")
-    reddit_posts = fetch_top_reddit_posts(SUBREDDITS, len(SUBREDDITS))
+    reddit_posts = fetch_top_reddit_posts(SUBREDDITS)
     logger.info(f"Got {len(reddit_posts)} subreddit posts.")
 
     # 2. Fetch PubMed papers per term
@@ -382,7 +384,6 @@ def build_weekly_queue():
                 all_papers.append(p)
             elif not key:
                 # If no DOI/PMID, still keep but may duplicate – we'll rely on title
-                # For safety, add anyway; dedup later by title
                 all_papers.append(p)
 
     # Remove duplicates by title (case insensitive)
@@ -395,8 +396,7 @@ def build_weekly_queue():
 
     logger.info(f"After deduplication: {len(all_papers)} unique papers.")
 
-    # 4. Select one per term using DeepSeek (from original term_papers – but we need to run selection on the original grouped lists)
-    # We'll run selection on term_papers (already grouped), then map selected titles to the deduplicated paper list.
+    # 4. Select one per term using DeepSeek
     selection_response = deepseek_select_titles(term_papers)
     selected_titles = {}
     for line in selection_response.splitlines():
@@ -450,89 +450,39 @@ def build_weekly_queue():
                 unique_author_papers.append(p)
 
     # 6. Build queue entries
-    entries = []
-    # Add one entry per term paper (only if we have a subreddit post)
-    # Distribute named author papers evenly
-    all_papers = [p for p in term_picked_papers.values() if p is not None] + unique_author_papers
-    # Shuffle to avoid always same order? No, we want predictable: term papers first, then author papers.
     # Create list of (type, paper) tuples.
     paper_items = [("term", p) for p in term_picked_papers.values() if p is not None]
-    # Add author papers as separate entries
     for p in unique_author_papers:
         paper_items.append(("author", p))
 
-    # Ensure we have at least one subreddit post per daily entry
-    # We want each day to have 1 subreddit post + 1 paper (if available).
+    # Ensure we have at least one subreddit post per daily entry.
     # If we have more papers than subreddit posts, we'll distribute them across days.
     if not reddit_posts:
         logger.warning("No subreddit posts fetched, using dummy placeholder.")
         reddit_posts = [{"title": "No top post found", "body": "", "url": "", "upVotes": 0}]
 
-    # We'll create entries by zipping reddit_posts with paper_items, cycling reddit_posts if more papers than posts.
-    import itertools
-    reddit_cycle = itertools.cycle(reddit_posts)
-    for paper in paper_items:
-        post = next(reddit_cycle)
-        entries.append({
-            "type": "daily",
-            "subreddit_post": post,
-            "paper": paper[1],  # paper dict
-            "paper_type": paper[0]  # "term" or "author"
-        })
-
-    # If there are extra reddit posts without papers, we add them as standalone? But we want to include all 7 subreddits, so we need to ensure all posts are included.
-    # Better: create an entry for each subreddit post, and if no paper, still include it.
-    # Let's reconstruct: we want one daily entry per subreddit post, with paper from the list if available.
-    paper_idx = 0
-    final_entries = []
-    for post in reddit_posts:
-        # if there are papers left, assign one
-        if paper_idx < len(paper_items):
-            paper = paper_items[paper_idx][1]
-            paper_type = paper_items[paper_idx][0]
-            paper_idx += 1
-        else:
-            paper = None
-            paper_type = None
-        final_entries.append({
-            "type": "daily",
-            "subreddit_post": post,
-            "paper": paper,
-            "paper_type": paper_type
-        })
-
-    # If there are remaining papers after all posts, we can attach them to the first entries (or create extra entries).
-    # To keep simple, we'll distribute extra papers to the first few entries (each getting an extra paper entry).
-    # That means some days will have 2 papers, 1 subreddit post.
-    # We'll create a new list where each entry is a list of papers.
+    # Create an entry for each subreddit post, assigning one paper from the list if available.
+    # Extra papers (if any) will be appended to the first entries in a round‑robin fashion.
     entries_with_papers = []
     for i, post in enumerate(reddit_posts):
         entry_papers = []
-        # Assign the first paper to this post if index < len(paper_items)
         if i < len(paper_items):
             entry_papers.append(paper_items[i])
-        # If we have more papers than posts, we'll add extra to the first entries
-        # We'll handle after building the base
         entries_with_papers.append({"subreddit_post": post, "papers": entry_papers})
 
-    # Add remaining papers (if any) to the first entries in a round-robin fashion
+    # Add remaining papers (if any) to the first entries in a round‑robin fashion
     extra_papers = paper_items[len(reddit_posts):]
     for idx, paper in enumerate(extra_papers):
         target_idx = idx % len(entries_with_papers)
         entries_with_papers[target_idx]["papers"].append(paper)
 
-    # Now convert to the final queue entries
+    # Convert to final queue format
     final_queue = []
     for entry in entries_with_papers:
-        # There will be at least one paper? Possibly none if no papers at all.
-        # We'll create one daily digest item per entry; it can have 0,1,2 papers.
         final_queue.append({
             "subreddit_post": entry["subreddit_post"],
             "papers": entry["papers"]  # list of (type, paper) tuples
         })
-
-    # If no papers at all, we can still send subreddit posts only.
-    # But we want to send 7 days. We'll just send each subreddit post with its assigned papers (could be empty).
 
     # Save queue
     save_queue(final_queue)
@@ -568,7 +518,6 @@ def send_daily_digest():
         body = subreddit_post.get("body", "")
         url = subreddit_post.get("url", "")
         upvotes = subreddit_post.get("upVotes", 0)
-        # Summarize subreddit post using DeepSeek (5 sentences)
         summary = deepseek_summarize_single(
             title=title,
             abstract=body[:1500],
@@ -583,7 +532,6 @@ def send_daily_digest():
     for paper_type, paper in papers:
         if not paper:
             continue
-        # Determine header
         if paper_type == "author":
             header = f"Named Author: {', '.join(paper['authors'][:2])}"
         else:
@@ -602,13 +550,8 @@ def send_daily_digest():
     if not full_message.strip():
         full_message = "No content available for today."
 
-    # Send via Telegram
     send_telegram(full_message)
-
-    # Mark sent today
     mark_sent_today()
-
-    # Save updated queue
     save_queue(entries)
     logger.info("Daily digest sent and queue updated.")
 
@@ -617,7 +560,6 @@ def send_daily_digest():
 # =============================================================================
 
 def main():
-    # Check peak pricing for both modes
     ok, reason = should_run()
     now = datetime.now(timezone.utc)
     logger.info(f"Current UTC time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
