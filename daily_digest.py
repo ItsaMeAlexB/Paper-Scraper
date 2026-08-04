@@ -28,11 +28,11 @@ MODE = os.environ.get("DAILY_MODE", "daily").lower()
 QUEUE_FILE = "weekly_queue.json"
 LAST_SENT_FILE = "last_sent_date.txt"
 
-# DeepSeek peak pricing windows in UTC (same as before)
+# DeepSeek peak pricing windows in UTC
 PEAK_WINDOWS = [(1, 4), (6, 10)]
 PEAK_BUFFER_MINUTES = 30
 
-# Search terms – we now have 7
+# Search terms – now 7
 TERMS = {
     "Gene Editing": '"gene editing"',
     "Genome Engineering": '"genome engineering"',
@@ -43,13 +43,13 @@ TERMS = {
     "Cell Therapy": '"cell therapy"',
 }
 
-# Named authors (always included if they published in the week)
+# Named authors
 AUTHOR_TERMS = [
     '"David R Liu"[AU]',
     '"Ciaran M Lee"[AU]',
 ]
 
-# Subreddits to scrape
+# Subreddits
 SUBREDDITS = [
     "bioinformatics",
     "labrats",
@@ -64,7 +64,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# DEEPSEEK PEAK PRICING CHECKS (unchanged)
+# PEAK PRICING CHECKS
 # =============================================================================
 
 def is_deepseek_peak_time(dt: datetime) -> bool:
@@ -97,7 +97,7 @@ def should_run() -> tuple[bool, str]:
     return True, "All checks passed — running now!"
 
 # =============================================================================
-# PUBMED FUNCTIONS (unchanged)
+# PUBMED FUNCTIONS
 # =============================================================================
 
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
@@ -163,74 +163,51 @@ def fetch_metadata(pmids):
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-def deepseek_select_titles(term_papers):
-    sections_text = ""
-    for section_name, papers in term_papers.items():
-        sections_text += f"{section_name}:\n"
-        if not papers:
-            sections_text += "NO_TITLES\n\n"
-        else:
-            for i, p in enumerate(papers, 1):
-                sections_text += f"{i}. {p['title']}\n"
-            sections_text += "\n"
+def deepseek_select_title_for_term(term_name, papers):
+    """Select the most significant title for a single search term."""
+    if not papers:
+        return "NO_TITLES"
 
-    prompt = f"""For each of the following topics, from the list of titles provided, pick the 1 most useful paper based on its title (e.g. if it's a review it would explain something well), significant (e.g. if it's primary article it has interesting findings), and relevant (e.g. not just an article that mentions gene editing in passing or uses it as a method for investigating an irrelevant topic).
+    titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(papers)])
+    prompt = f"""From the following list of titles for the topic "{term_name}", pick the 1 most useful paper based on its title.
 
-Return your answer in the exact format below, with one title per topic. Use the exact titles as they appear.
+Criteria:
+- Useful: e.g., a review that explains something well
+- Significant: e.g., a primary article with interesting findings
+- Relevant: not just an article that mentions {term_name} in passing or uses it as a method for investigating an irrelevant topic
 
-Topics and titles:
+Titles:
+{titles_text}
 
-{sections_text}
-
+Return only the exact title as it appears, nothing else.
 If the list is empty, return "NO_TITLES".
-
-Format:
-Gene Editing: <exact title>
-Genome Engineering: <exact title>
-Vectors: <exact title>
-Gene Therapy: <exact title>
-Computational Biology: <exact title>
-Gene Delivery: <exact title>
-Cell Therapy: <exact title>
 """
     payload = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 2000,
+        "max_tokens": 500,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-
     try:
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"].strip()
-        if content:
-            return content
-        else:
-            logger.warning("DeepSeek returned empty content – using fallback.")
-            selected = {}
-            for section_name, papers in term_papers.items():
-                selected[section_name] = papers[0]['title'] if papers else "NO_TITLES"
-            response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
-            return response
+        return content if content else "NO_TITLES"
     except Exception as e:
-        logger.error(f"Selection error: {e}")
-        selected = {}
-        for section_name, papers in term_papers.items():
-            selected[section_name] = papers[0]['title'] if papers else "NO_TITLES"
-        response = "\n".join([f"{k}: {v}" for k, v in selected.items()])
-        return response
+        logger.error(f"Selection error for {term_name}: {e}")
+        # Fallback: return first title
+        return papers[0]['title'] if papers else "NO_TITLES"
 
-def deepseek_summarize_single(title, abstract, journal, doi, authors, item_type="paper"):
+def deepseek_summarize_single(title, abstract, journal, last_author, item_type="paper"):
+    """Generate a 5‑sentence summary for a single item (paper or subreddit post)."""
     prompt = f"""You are a scientific summariser. Write a concise 5‑sentence summary of the following {item_type}.
 
 {item_type.capitalize()} details:
 Title: {title}
 Journal: {journal}
-DOI: {doi}
-Authors: {', '.join(authors[:5])}
+Last author (lab): {last_author if last_author else "N/A"}
 Abstract: {abstract[:1500]}
 
 Rules:
@@ -257,7 +234,7 @@ Rules:
         return "⚠️ Summary generation failed."
 
 # =============================================================================
-# SUBREDDIT FETCH (via Apify) – FIXED: one call per subreddit
+# SUBREDDIT FETCH (via Apify)
 # =============================================================================
 
 def fetch_top_reddit_posts(subreddits):
@@ -280,11 +257,10 @@ def fetch_top_reddit_posts(subreddits):
             for item in client.dataset(run["defaultDatasetId"]).iterate_items():
                 if item.get("dataType") == "post":
                     posts.append(item)
-                    break  # only one per subreddit
+                    break
         except Exception as e:
             logger.error(f"Apify error for {sub}: {e}")
-        time.sleep(0.5)  # be gentle to the API
-    # Sort all collected posts by upVotes (though we already have one per sub)
+        time.sleep(0.5)  # be gentle
     posts.sort(key=lambda x: x.get("upVotes", 0), reverse=True)
     return posts
 
@@ -325,7 +301,7 @@ def mark_sent_today():
         f.write(today)
 
 # =============================================================================
-# TELEGRAM FUNCTIONS (unchanged)
+# TELEGRAM FUNCTIONS
 # =============================================================================
 
 def send_telegram(message):
@@ -355,7 +331,7 @@ def build_weekly_queue():
     start_date = now - timedelta(days=7)
     end_date = now
 
-    # 1. Fetch subreddit posts – one per subreddit
+    # 1. Fetch subreddit posts
     logger.info("Fetching top weekly posts from subreddits...")
     reddit_posts = fetch_top_reddit_posts(SUBREDDITS)
     logger.info(f"Got {len(reddit_posts)} subreddit posts.")
@@ -373,7 +349,7 @@ def build_weekly_queue():
         else:
             term_papers[section_name] = []
 
-    # 3. Deduplicate across search terms by DOI/PMID (keep only unique papers)
+    # 3. Deduplicate across search terms by DOI/PMID/title
     all_papers = []
     seen_ids = set()
     for section, papers in term_papers.items():
@@ -383,10 +359,8 @@ def build_weekly_queue():
                 seen_ids.add(key)
                 all_papers.append(p)
             elif not key:
-                # If no DOI/PMID, still keep but may duplicate – we'll rely on title
                 all_papers.append(p)
 
-    # Remove duplicates by title (case insensitive)
     unique_by_title = {}
     for p in all_papers:
         title = p["title"].strip().lower()
@@ -396,37 +370,29 @@ def build_weekly_queue():
 
     logger.info(f"After deduplication: {len(all_papers)} unique papers.")
 
-    # 4. Select one per term using DeepSeek
-    selection_response = deepseek_select_titles(term_papers)
-    selected_titles = {}
-    for line in selection_response.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if key in TERMS and value.lower() != "no_titles":
-            selected_titles[key] = value
-
-    # For each term, find the paper in the deduplicated list that matches the title
+    # 4. Select one per term – one DeepSeek call per term
     term_picked_papers = {}
-    for term, title in selected_titles.items():
+    for term_name, papers in term_papers.items():
+        if not papers:
+            term_picked_papers[term_name] = None
+            continue
+        selected_title = deepseek_select_title_for_term(term_name, papers)
+        if selected_title == "NO_TITLES":
+            term_picked_papers[term_name] = None
+            continue
+        # Find matching paper in all_papers
         matched = None
         for p in all_papers:
-            if p["title"].strip().lower() == title.lower():
+            if p["title"].strip().lower() == selected_title.lower():
                 matched = p
                 break
         if matched:
-            term_picked_papers[term] = matched
+            term_picked_papers[term_name] = matched
         else:
-            # Fallback: take first paper from the original term list (if any)
-            if term_papers.get(term):
-                term_picked_papers[term] = term_papers[term][0]
-            else:
-                term_picked_papers[term] = None
+            # Fallback: first paper from the original list
+            term_picked_papers[term_name] = papers[0] if papers else None
 
-    # 5. Fetch named author papers (if any from last 7 days)
+    # 5. Fetch named author papers
     author_papers = []
     for author_query in AUTHOR_TERMS:
         logger.info(f"Fetching papers for {author_query}...")
@@ -435,7 +401,7 @@ def build_weekly_queue():
             papers = fetch_metadata(pmids)
             author_papers.extend(papers)
 
-    # Deduplicate author papers against already selected
+    # Deduplicate author papers against selected
     selected_dois = {p.get("doi") for p in term_picked_papers.values() if p and p.get("doi")}
     selected_pmids = {p.get("pmid") for p in term_picked_papers.values() if p and p.get("pmid")}
     unique_author_papers = []
@@ -444,25 +410,20 @@ def build_weekly_queue():
         if key and key not in selected_dois and key not in selected_pmids:
             unique_author_papers.append(p)
         elif not key:
-            # Check by title
             title = p["title"].strip().lower()
             if title not in {ap["title"].strip().lower() for ap in term_picked_papers.values() if ap}:
                 unique_author_papers.append(p)
 
-    # 6. Build queue entries
-    # Create list of (type, paper) tuples.
+    # 6. Build queue
     paper_items = [("term", p) for p in term_picked_papers.values() if p is not None]
     for p in unique_author_papers:
         paper_items.append(("author", p))
 
-    # Ensure we have at least one subreddit post per daily entry.
-    # If we have more papers than subreddit posts, we'll distribute them across days.
     if not reddit_posts:
         logger.warning("No subreddit posts fetched, using dummy placeholder.")
         reddit_posts = [{"title": "No top post found", "body": "", "url": "", "upVotes": 0}]
 
-    # Create an entry for each subreddit post, assigning one paper from the list if available.
-    # Extra papers (if any) will be appended to the first entries in a round‑robin fashion.
+    # Create entries: one per subreddit post, assign papers in order, extra papers round‑robin
     entries_with_papers = []
     for i, post in enumerate(reddit_posts):
         entry_papers = []
@@ -470,13 +431,11 @@ def build_weekly_queue():
             entry_papers.append(paper_items[i])
         entries_with_papers.append({"subreddit_post": post, "papers": entry_papers})
 
-    # Add remaining papers (if any) to the first entries in a round‑robin fashion
     extra_papers = paper_items[len(reddit_posts):]
     for idx, paper in enumerate(extra_papers):
         target_idx = idx % len(entries_with_papers)
         entries_with_papers[target_idx]["papers"].append(paper)
 
-    # Convert to final queue format
     final_queue = []
     for entry in entries_with_papers:
         final_queue.append({
@@ -484,7 +443,6 @@ def build_weekly_queue():
             "papers": entry["papers"]  # list of (type, paper) tuples
         })
 
-    # Save queue
     save_queue(final_queue)
     logger.info(f"Built weekly queue with {len(final_queue)} daily entries.")
 
@@ -493,58 +451,55 @@ def build_weekly_queue():
 # =============================================================================
 
 def send_daily_digest():
-    # Check if already sent today
     if has_sent_today():
         logger.info("Already sent today – skipping.")
         return
 
-    # Load queue
     entries = load_queue()
     if not entries:
         logger.info("Queue is empty – no digest to send.")
         return
 
-    # Pop first entry
     entry = entries.pop(0)
     subreddit_post = entry.get("subreddit_post")
-    papers = entry.get("papers", [])  # list of (type, paper) tuples
+    papers = entry.get("papers", [])
 
-    # Build digest text
     digest_parts = []
 
-    # Subreddit post section
+    # Subreddit post
     if subreddit_post:
         title = subreddit_post.get("title", "No title")
         body = subreddit_post.get("body", "")
         url = subreddit_post.get("url", "")
         upvotes = subreddit_post.get("upVotes", 0)
+        subreddit_name = subreddit_post.get("communityName", "unknown")
+        # Summarize using DeepSeek (no lab/journal for reddit)
         summary = deepseek_summarize_single(
             title=title,
             abstract=body[:1500],
             journal="Reddit",
-            doi="",
-            authors=[],
+            last_author="",
             item_type="subreddit post"
         )
-        digest_parts.append(f"Reddit Post: {title}\nURL: {url}\nUpvotes: {upvotes}\nSummary: {summary}\n")
+        digest_parts.append(f"Title: {title}\nUpvotes: {upvotes}\nSubreddit: {subreddit_name}\nSummary: {summary}\n")
 
     # Papers
     for paper_type, paper in papers:
         if not paper:
             continue
-        if paper_type == "author":
-            header = f"Named Author: {', '.join(paper['authors'][:2])}"
-        else:
-            header = "Selected Paper"
+        last_author = paper['authors'][-1] if paper.get('authors') else "Unknown"
+        journal = paper.get('journal', "Unknown journal")
         summary = deepseek_summarize_single(
             title=paper["title"],
             abstract=paper["abstract"],
-            journal=paper["journal"],
-            doi=paper["doi"] or "N/A",
-            authors=paper["authors"],
+            journal=journal,
+            last_author=last_author,
             item_type="paper"
         )
-        digest_parts.append(f"{header}: Journal: {paper['journal']}, DOI: {paper['doi'] or 'N/A'}, Summary: {summary}\n")
+        if paper_type == "author":
+            digest_parts.append(f"Named Author: {paper['title']}\nLab: {last_author} Lab\nJournal: {journal}\nSummary: {summary}\n")
+        else:
+            digest_parts.append(f"Title: {paper['title']}\nLab: {last_author} Lab\nJournal: {journal}\nSummary: {summary}\n")
 
     full_message = "\n".join(digest_parts)
     if not full_message.strip():
