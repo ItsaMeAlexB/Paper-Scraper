@@ -1,1 +1,91 @@
-{"week_start": "", "entries": []}
+{
+  "week_start": "2026-08-09T05:26:48.729229+00:00",
+  "entries": [
+    {
+      "subreddit_post": {
+        "title": "No top post found",
+        "body": "",
+        "url": "",
+        "upVotes": 0
+      },
+      "papers": [
+        [
+          "term",
+          {
+            "doi": "10.1016/j.molcel.2026.07.015",
+            "title": "Stepwise DNA-unwinding gates TnpB genome-editing activity.",
+            "abstract": "TnpB is a compact RNA-guided endonuclease and an evolutionary ancestor of CRISPR-Cas12 that offers a promising platform for genome engineering. However, the genome-editing activity of TnpBs remains limited, and its underlying determinants are poorly understood. Here, we used biochemical and single-molecule assays to examine the DNA-unwinding mechanism of Youngiibacter multivorans TnpB (Ymu1 TnpB). DNA unwinding proceeds through a discrete, long-lived, partially unwound intermediate state before reaching a fully unwound open state. The open state forms inefficiently and collapses readily in the absence of negative supercoiling. An optimized variant, H4W-L304F-V305R (Ymu1-WFR), stabilizes formation of both the intermediate and open states, resulting in enhanced DNA cleavage in vitro and increased genome editing in plants. These findings identify the physical basis for the observed minimal activities of natural TnpBs, revealing how stabilizing specific unwinding states enables efficient DNA targeting.",
+            "authors": [
+              "Zhou Z",
+              "Saffarian-Deemyad I",
+              "Shi H",
+              "Weiss T",
+              "Ur-Rehman MM",
+              "Vohra K",
+              "Skopintsev P",
+              "Yoon PH",
+              "Trinidad MI",
+              "Langeberg CJ",
+              "Kamalu M",
+              "Amerasekera J",
+              "Zhou Y",
+              "Doherty EE",
+              "Aris KDP",
+              "Al-Sayyad N",
+              "Thornton BW",
+              "Weissman RF",
+              "Wasko KM",
+              "Esain-Garcia I",
+              "DeTurk EC",
+              "Savage DF",
+              "Jacobsen SE",
+              "Bryant Z",
+              "Doudna JA"
+            ],
+            "journal": "Molecular cell",
+            "date": "2026 Aug 5",
+            "pmid": "42556347"
+          }
+        ],
+        [
+          "term",
+          {
+            "doi": "10.1177/10430342261466823",
+            "title": "Novel VSV-G Variants with Enhanced Blinding for Targeted Delivery of Lentiviral Vectors.",
+            "abstract": "Targeted in vivo transduction, entailing direct administration of viral vector preparations to patients, is the next big step in gene therapy. To redirect lentiviral vector (LV) particles selectively to desired cell type(s), different glycoproteins have been engineered to alter their tropism, including the glycoprotein G from Vesicular Stomatitis Virus (VSV-G) as the most commonly employed tropism-defining protein for LV particles. For detargeting from its natural receptor, the low-density lipoprotein receptor (LDLR), a VSV-G variant with two blinding substitutions, K47Q and R354A, is commonly used (VSV-G.pub). We provide first evidence for insufficient blinding of VSV-G.pub in human and murine cell lines and primary cells. In silico modeling pointed toward only slightly reduced LDLR binding affinity of VSV-G.pub. To lower the affinity further, we generated three novel VSV-G variants based on charge-reversing substitutions in two, four, or six key residues. These variants achieved a more stringent blinding compared with VSV-G.pub in the tested cell lines and primary cells. Codisplay of a CD4 binder enabled lentiviral particles pseudotyped with the novel variants to selectively transduce CD4-expressing cells. In summary, we present improved VSV-G variants with a better on/off-target ratio as attractive tools for in vivo gene therapy applications.",
+            "authors": [
+              "Warnecke FL",
+              "Ertelt M",
+              "Shrivastava A",
+              "Harre J",
+              "Warnecke A",
+              "Araujo AE",
+              "Buning H",
+              "Morgan M",
+              "Schoeder CT",
+              "Schott JW",
+              "Schambach A"
+            ],
+            "journal": "Human gene therapy",
+            "date": "2026 Aug 3",
+            "pmid": "42544545"
+          }
+        ],
+        [
+          "term",
+          {
+            "doi": "10.1188/26.CJON.309-313",
+            "title": "Cellular Therapy Essentials: An Overview of Cellular Therapy Products and Nursing Management.",
+            "abstract": "Scientific advances have expanded cellular therapy beyond its association with stem cell transplantation to include a growing array of products that use a patient's own cells and genetic material to treat disease. Currently.",
+            "authors": [
+              "Bell C"
+            ],
+            "journal": "Clinical journal of oncology nursing",
+            "date": "2026 Aug 3",
+            "pmid": "42555786"
+          }
+        ]
+      ]
+    }
+  ]
+}
