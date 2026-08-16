@@ -1,30 +1,4 @@
 {
-  "week_start": "2026-08-16T04:59:39.364804+00:00",
-  "entries": [
-    {
-      "subreddit_post": {
-        "title": "No top post found",
-        "body": "",
-        "url": "",
-        "upVotes": 0
-      },
-      "papers": [
-        [
-          "term",
-          {
-            "doi": "10.1016/j.pbiomolbio.2026.08.002",
-            "title": "Gene Therapy: The Current Trajectory of Clinical and Commercial Translation.",
-            "abstract": "The rapid pace of innovation in gene therapy has ushered in a new era of transformative medicine, as demonstrated by landmark clinical success in the rapid development and administration of the first personalized n-of-1 treatment for carbamoyl-phosphate synthetase 1 deficiency. While the therapeutic efficacy and safety profiles of these cutting-edge modalities have steadily improved, the primary barriers to their broad clinical translation are becoming increasingly clear. The most significant challenges are no longer confined to the on-target potency of the therapeutic itself; rather, they are rooted in the complexities of commercial formulation and the limitations of a traditional regulatory framework. The scientific progress in drug efficacy, while continuous and necessary, is now outpaced by the significant logistical and procedural hurdles of scaling production, ensuring product consistency, and navigating a regulatory landscape that was not designed for the unique characteristics of these one-time, patient-specific therapies. This review will explore how production bottlenecks, matters of market demand and regulatory compliance, as well as the perpetuation of traditional systemic incentives now stand as the predominant forces impeding the translatability of advanced gene therapies from bench to bedside and delve into the prevailing institutional strategies for providing its access to patients.",
-            "authors": [
-              "Gibson JR",
-              "Cottle RN"
-            ],
-            "journal": "Progress in biophysics and molecular biology",
-            "date": "2026 Aug 15",
-            "pmid": "42603691"
-          }
-        ]
-      ]
-    }
-  ]
+  "week_start": "2026-08-16T23:34:09.116240+00:00",
+  "entries": []
 }
