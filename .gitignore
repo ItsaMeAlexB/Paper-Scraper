@@ -145,21 +145,21 @@ cython_debug/
 .DS_Store
 Thumbs.db
 
-# Old cache files (no longer used – but we keep these ignored)
-sent_cache.txt
-last_run_date.txt
-
-# Apify local cache (if any)
+# Apify local cache
 .apify_local/
 
 # Logs and temp files
 *.log
 /tmp
 
+# Old cache files (no longer used)
+sent_cache.txt
+last_run_date.txt
+
 # ==================== EXCEPTIONS ====================
-# We want to track these state files in the repository
-!weekly_queue.json
+# We want to track these state/config files in the repository
+!sources.txt
 !last_sent_date.txt
 
-# Ensure the workflows are tracked (they are, but just in case)
+# Ensure GitHub workflows are tracked
 !.github/workflows/*.yml
