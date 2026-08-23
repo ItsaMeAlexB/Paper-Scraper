@@ -2,7 +2,6 @@ name: Daily Digest
 on:
   workflow_dispatch:
   schedule:
-    # Runs at 23:15, 00:15, 01:15, 02:15, 03:15, 04:15, 05:15, 06:15, 07:15 UTC
     - cron: '15 23,0-7 * * *'
 jobs:
   run:
@@ -28,13 +27,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
           APIFY_API: ${{ secrets.APIFY_API }}
-          DAILY_MODE: daily
         run: python daily_digest.py
-      - name: Commit and push updated queue
+      - name: Commit and push state
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add weekly_queue.json last_sent_date.txt 2>/dev/null || true
-          git commit -m "Update queue after daily send [skip ci]" || echo "No changes"
+          git add last_sent_date.txt sources.txt 2>/dev/null || true
+          git commit -m "Update last sent date [skip ci]" || echo "No changes"
           git push
