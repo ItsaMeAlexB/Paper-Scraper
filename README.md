@@ -15,13 +15,18 @@ Setup
 4. Commit sources.txt and last_sent_date.txt (empty) to repo.
 5. The GitHub Action daily.yml runs daily (off‑peak) and sends once per day.
 
-Rotation: uses weekday index to cycle through terms and subreddits. Date windows: terms from last N days (N=number of terms), subreddit from last M days (M=number of subreddits), authors from last 1 day.
+Rotation: uses weekday index to cycle through terms and subreddits. Date windows:
+- PubMed terms: fetch from last N days (N = number of terms)
+- Reddit subreddit: fetch top posts from last M days (M = number of subreddits)
+- Named authors: checked from last 1 day
 
-Reddit: fetches top 3 weekly posts, picks first with body length > 0, then fetches its top comment.
+Reddit: fetches top 3 posts from the dynamic window, picks first with body length > 0, then fetches its top comment.
 
 Output: one Telegram message with Reddit post + top comment (if any), one selected paper, and all named author papers from the last day.
 
 Peak pricing protection: skips runs during DeepSeek peak windows (01-04 and 06-10 UTC) and within 30 minutes before.
+
+Future: Consider switching to a lightweight model (e.g., Qwen3-1.7B PubMed) for summarization to reduce API costs.
 
 Files: daily_digest.py, sources.txt, daily.yml, last_sent_date.txt, requirements.txt, .gitignore.
 
