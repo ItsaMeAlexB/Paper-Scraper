@@ -1,0 +1,25 @@
+# sources.txt – configuration for Daily Digest
+# Sections: [TERMS], [SUBREDDITS], [AUTHORS]
+# One item per line. Lines starting with # are ignored.
+
+[TERMS]
+gene editing
+genome engineering
+"viral vector" OR "non-viral vector"
+gene therapy
+computational biology
+gene delivery
+cell therapy
+
+[SUBREDDITS]
+bioinformatics
+labrats
+biotech
+molecularbiology
+biochemistry
+CRISPR
+ClinTrials
+
+[AUTHORS]
+David R Liu
+Ciaran M Lee
