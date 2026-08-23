@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 import os
 import sys
-import re
 import time
 import json
 import logging
-import random
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -21,11 +19,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 APIFY_API_KEY = os.environ.get("APIFY_API")
 
-# File to track last sent date
 LAST_SENT_FILE = "last_sent_date.txt"
 CONFIG_FILE = "sources.txt"
 
-# DeepSeek peak pricing windows
 PEAK_WINDOWS = [(1, 4), (6, 10)]
 PEAK_BUFFER_MINUTES = 30
 
@@ -33,11 +29,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# LOAD CONFIG FROM sources.txt
+# LOAD CONFIG
 # =============================================================================
 
 def load_config():
-    """Parse sources.txt: sections [TERMS], [SUBREDDITS], [AUTHORS]."""
     if not os.path.exists(CONFIG_FILE):
         logger.error(f"Config file {CONFIG_FILE} not found.")
         sys.exit(1)
@@ -45,26 +40,24 @@ def load_config():
     with open(CONFIG_FILE, "r") as f:
         lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
-    terms = []
-    subreddits = []
-    authors = []
-    current_section = None
+    terms, subreddits, authors = [], [], []
+    current = None
     for line in lines:
         if line.startswith("[TERMS]"):
-            current_section = "terms"
+            current = "terms"
             continue
         elif line.startswith("[SUBREDDITS]"):
-            current_section = "subreddits"
+            current = "subreddits"
             continue
         elif line.startswith("[AUTHORS]"):
-            current_section = "authors"
+            current = "authors"
             continue
 
-        if current_section == "terms":
+        if current == "terms":
             terms.append(line)
-        elif current_section == "subreddits":
+        elif current == "subreddits":
             subreddits.append(line)
-        elif current_section == "authors":
+        elif current == "authors":
             authors.append(line)
 
     if not terms or not subreddits:
@@ -74,24 +67,21 @@ def load_config():
     return terms, subreddits, authors
 
 TERMS, SUBREDDITS, AUTHORS = load_config()
-
-# Named authors are used as-is in PubMed queries
-AUTHOR_QUERIES = [f'"{author}"[AU]' for author in AUTHORS]
+AUTHOR_QUERIES = [f'"{a}"[AU]' for a in AUTHORS]
 
 # =============================================================================
-# PEAK PRICING CHECKS
+# PEAK PRICING
 # =============================================================================
 
-def is_deepseek_peak_time(dt: datetime) -> bool:
+def is_deepseek_peak_time(dt):
     hour = dt.hour
     for start, end in PEAK_WINDOWS:
         if start <= hour < end:
             return True
     return False
 
-def is_within_buffer_of_peak(dt: datetime, buffer_minutes: int) -> bool:
-    hour = dt.hour
-    minute = dt.minute
+def is_within_buffer_of_peak(dt, buffer_minutes):
+    hour, minute = dt.hour, dt.minute
     for start_hour, _ in PEAK_WINDOWS:
         if hour < start_hour:
             minutes_until = (start_hour - hour) * 60 - minute
@@ -103,16 +93,16 @@ def is_within_buffer_of_peak(dt: datetime, buffer_minutes: int) -> bool:
             return True
     return False
 
-def should_run() -> tuple[bool, str]:
+def should_run():
     now = datetime.now(timezone.utc)
     if is_deepseek_peak_time(now):
         return False, f"Inside peak window (UTC {now.strftime('%H:%M')})"
     if is_within_buffer_of_peak(now, PEAK_BUFFER_MINUTES):
-        return False, f"Within {PEAK_BUFFER_MINUTES}min buffer before peak (UTC {now.strftime('%H:%M')})"
+        return False, f"Within {PEAK_BUFFER_MINUTES}min buffer before peak"
     return True, "All checks passed"
 
 # =============================================================================
-# PUBMED FUNCTIONS
+# PUBMED
 # =============================================================================
 
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
@@ -173,13 +163,12 @@ def fetch_metadata(pmids):
     return papers
 
 # =============================================================================
-# DEEPSEEK API FUNCTIONS
+# DEEPSEEK
 # =============================================================================
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def deepseek_select_title(term_name, papers):
-    """Select the most significant title for a single search term."""
     if not papers:
         return None
     titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(papers)])
@@ -212,11 +201,9 @@ If the list is empty, return "NO_TITLES".
         return None
     except Exception as e:
         logger.error(f"Selection error for {term_name}: {e}")
-        # fallback: first title
         return papers[0]['title'] if papers else None
 
 def deepseek_summarize_single(title, abstract, journal, last_author, item_type="paper"):
-    """Generate a 5‑sentence summary for a single item."""
     prompt = f"""You are a scientific summariser. Write a concise 5‑sentence summary of the following {item_type}.
 
 {item_type.capitalize()} details:
@@ -248,19 +235,24 @@ Rules:
         return "⚠️ Summary generation failed."
 
 # =============================================================================
-# REDDIT FETCH (harshmaur/reddit-scraper)
+# REDDIT (harshmaur/reddit-scraper)
 # =============================================================================
 
-def fetch_top_posts(subreddit, max_posts=3):
-    """Fetch top N posts from a subreddit's weekly top list."""
+def fetch_top_posts(subreddit, max_posts=3, days_back=7):
+    """Fetch top posts from the last `days_back` days for a subreddit."""
     if not APIFY_API_KEY:
         logger.error("APIFY_API secret not set")
         return []
     client = ApifyClient(APIFY_API_KEY)
-    url = f"https://www.reddit.com/r/{subreddit}/top/?t=week"
+    now = datetime.now(timezone.utc)
+    posted_after = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    posted_before = now.strftime("%Y-%m-%d")
+    url = f"https://www.reddit.com/r/{subreddit}/top/"
     run_input = {
         "startUrls": [{"url": url}],
         "maxPostsCount": max_posts,
+        "postedAfter": posted_after,
+        "postedBefore": posted_before,
         "crawlCommentsPerPost": False,
         "includeNSFW": False,
         "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
@@ -275,7 +267,6 @@ def fetch_top_posts(subreddit, max_posts=3):
         return []
 
 def fetch_top_comment(post_url):
-    """Fetch the top comment (by score) from a given post URL."""
     if not post_url:
         return None
     client = ApifyClient(APIFY_API_KEY)
@@ -291,7 +282,6 @@ def fetch_top_comment(post_url):
         items = list(client.dataset(run.default_dataset_id).iterate_items())
         comments = [i for i in items if i.get("dataType") == "comment"]
         if comments:
-            # Reddit returns comments sorted by score? We'll sort just in case.
             comments.sort(key=lambda c: c.get("upVotes") or 0, reverse=True)
             return comments[0]
         return None
@@ -321,7 +311,7 @@ def send_telegram(message):
             raise
 
 # =============================================================================
-# DAILY SEND STATE
+# DAILY STATE
 # =============================================================================
 
 def has_sent_today():
@@ -343,7 +333,6 @@ def mark_sent_today():
 # =============================================================================
 
 def main():
-    # Peak pricing
     ok, reason = should_run()
     now = datetime.now(timezone.utc)
     logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -355,19 +344,19 @@ def main():
         logger.info("Already sent today – skipping.")
         return
 
-    # Rotation: day of week modulo list lengths
-    day_index = now.weekday()  # 0=Monday, 6=Sunday
+    # Rotation
+    day_index = now.weekday()          # 0=Monday, 6=Sunday
     term_idx = day_index % len(TERMS)
     sub_idx = day_index % len(SUBREDDITS)
-
     term_name = TERMS[term_idx]
-    term_query = TERMS[term_idx]  # same as name for our config
+    term_query = TERMS[term_idx]       # same string, may contain quotes/OR
     subreddit = SUBREDDITS[sub_idx]
 
     logger.info(f"Today: term='{term_name}', subreddit='{subreddit}'")
 
-    # --- 1. Reddit ---
-    posts = fetch_top_posts(subreddit, max_posts=3)
+    # --- 1. Reddit: top post from last M days (M = number of subreddits) ---
+    M = len(SUBREDDITS)
+    posts = fetch_top_posts(subreddit, max_posts=3, days_back=M)
     valid_post = None
     for p in posts:
         if len(p.get("body", "") or "") > 0:
@@ -389,11 +378,10 @@ def main():
             "comment": comment["body"] if comment else None
         }
 
-    # --- 2. PubMed for this term (last N days) ---
+    # --- 2. PubMed: papers for term from last N days (N = number of terms) ---
     N = len(TERMS)
     start_date = now - timedelta(days=N)
-    end_date = now
-    pmids = fetch_all_pmids(term_query, start_date, end_date)
+    pmids = fetch_all_pmids(term_query, start_date, now)
     papers = fetch_metadata(pmids) if pmids else []
     logger.info(f"Found {len(papers)} papers for term '{term_name}'.")
 
@@ -406,37 +394,37 @@ def main():
                     selected_paper = p
                     break
             if not selected_paper:
-                selected_paper = papers[0]  # fallback
+                selected_paper = papers[0]
 
-    # --- 3. Named authors (last 1 day) ---
+    # --- 3. Named authors: last 1 day ---
     named_papers = []
     for auth_q in AUTHOR_QUERIES:
-        auth_pmids = fetch_all_pmids(auth_q, now - timedelta(days=1), end_date)
+        auth_pmids = fetch_all_pmids(auth_q, now - timedelta(days=1), now)
         if auth_pmids:
             auth_papers = fetch_metadata(auth_pmids)
             named_papers.extend(auth_papers)
 
-    # Deduplicate named papers against the selected paper
+    # deduplicate against selected
     if selected_paper:
-        selected_doi = selected_paper.get("doi")
-        selected_pmid = selected_paper.get("pmid")
-        named_papers = [p for p in named_papers if p.get("doi") != selected_doi and p.get("pmid") != selected_pmid]
+        sel_doi = selected_paper.get("doi")
+        sel_pmid = selected_paper.get("pmid")
+        named_papers = [p for p in named_papers if p.get("doi") != sel_doi and p.get("pmid") != sel_pmid]
 
     # --- 4. Build message ---
-    digest_lines = []
+    lines = []
 
-    # Reddit post
+    # Reddit
     if reddit_entry:
-        summary_text = deepseek_summarize_single(
+        summary = deepseek_summarize_single(
             title=reddit_entry["title"],
             abstract=reddit_entry["body"][:1500],
             journal="Reddit",
             last_author="",
             item_type="subreddit post"
         )
-        digest_lines.append(f"Reddit Post: {reddit_entry['title']}")
-        digest_lines.append(f"Upvotes: {reddit_entry['upvotes']}  |  Subreddit: r/{reddit_entry['subreddit']}")
-        digest_lines.append(f"Summary: {summary_text}")
+        lines.append(f"Reddit Post: {reddit_entry['title']}")
+        lines.append(f"Upvotes: {reddit_entry['upvotes']}  |  Subreddit: r/{reddit_entry['subreddit']}")
+        lines.append(f"Summary: {summary}")
         if reddit_entry.get("comment"):
             comment_summary = deepseek_summarize_single(
                 title="Top Comment",
@@ -445,8 +433,8 @@ def main():
                 last_author="",
                 item_type="comment"
             )
-            digest_lines.append(f"Top Comment: {comment_summary}")
-        digest_lines.append("")  # separator
+            lines.append(f"Top Comment: {comment_summary}")
+        lines.append("")
 
     # Selected paper
     if selected_paper:
@@ -459,10 +447,10 @@ def main():
             last_author=last_author,
             item_type="paper"
         )
-        digest_lines.append(f"Paper: {selected_paper['title']}")
-        digest_lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
-        digest_lines.append(f"Summary: {summary}")
-        digest_lines.append("")
+        lines.append(f"Paper: {selected_paper['title']}")
+        lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
+        lines.append(f"Summary: {summary}")
+        lines.append("")
 
     # Named author papers
     for p in named_papers:
@@ -475,16 +463,15 @@ def main():
             last_author=last_author,
             item_type="paper"
         )
-        digest_lines.append(f"Named Author Paper: {p['title']}")
-        digest_lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
-        digest_lines.append(f"Summary: {summary}")
-        digest_lines.append("")
+        lines.append(f"Named Author Paper: {p['title']}")
+        lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
+        lines.append(f"Summary: {summary}")
+        lines.append("")
 
-    if not digest_lines:
-        digest_lines = ["No content available today."]
+    if not lines:
+        lines = ["No content available today."]
 
-    full_message = "\n".join(digest_lines).strip()
-
+    full_message = "\n".join(lines).strip()
     send_telegram(full_message)
     mark_sent_today()
     logger.info("Digest sent successfully.")
