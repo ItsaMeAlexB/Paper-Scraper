@@ -160,6 +160,8 @@ last_run_date.txt
 # We want to track these state/config files in the repository
 !sources.txt
 !last_sent_date.txt
+!term_index.txt
+!subreddit_index.txt
 
 # Ensure GitHub workflows are tracked
 !.github/workflows/*.yml
