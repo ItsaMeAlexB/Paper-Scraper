@@ -2,7 +2,6 @@
 import os
 import sys
 import time
-import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -21,6 +20,8 @@ APIFY_API_KEY = os.environ.get("APIFY_API")
 
 LAST_SENT_FILE = "last_sent_date.txt"
 CONFIG_FILE = "sources.txt"
+TERM_INDEX_FILE = "term_index.txt"
+SUBREDDIT_INDEX_FILE = "subreddit_index.txt"
 
 PEAK_WINDOWS = [(1, 4), (6, 10)]
 PEAK_BUFFER_MINUTES = 30
@@ -68,6 +69,35 @@ def load_config():
 
 TERMS, SUBREDDITS, AUTHORS = load_config()
 AUTHOR_QUERIES = [f'"{a}"[AU]' for a in AUTHORS]
+
+# =============================================================================
+# INDEX MANAGEMENT
+# =============================================================================
+
+def read_index(file_path):
+    if not os.path.exists(file_path):
+        return 0
+    try:
+        with open(file_path, "r") as f:
+            return int(f.read().strip())
+    except:
+        return 0
+
+def write_index(file_path, value):
+    with open(file_path, "w") as f:
+        f.write(str(value))
+
+def get_next_index(file_path, max_val):
+    idx = read_index(file_path)
+    if idx >= max_val:
+        idx = 0
+    return idx
+
+def increment_index(file_path, max_val):
+    idx = read_index(file_path) + 1
+    if idx >= max_val:
+        idx = 0
+    write_index(file_path, idx)
 
 # =============================================================================
 # PEAK PRICING
@@ -175,9 +205,10 @@ def deepseek_select_title(term_name, papers):
     prompt = f"""From the following list of titles for the topic "{term_name}", pick the 1 most useful paper based on its title.
 
 Criteria:
-- Useful: e.g., a review that explains something well
-- Significant: e.g., a primary article with interesting findings
+- Useful: e.g., a review that explains something well **and** offers a novel synthesis or perspective (not a mere summary)
+- Significant: e.g., a primary article with interesting findings, a meta‑analysis, benchmarking, or a new model
 - Relevant: not just an article that mentions {term_name} in passing or uses it as a method for investigating an irrelevant topic
+- Avoid scoping reviews that do nothing novel; they can be included only if they present new insights
 
 Titles:
 {titles_text}
@@ -204,7 +235,7 @@ If the list is empty, return "NO_TITLES".
         return papers[0]['title'] if papers else None
 
 def deepseek_summarize_single(title, abstract, journal, last_author, item_type="paper"):
-    prompt = f"""You are a scientific summariser. Write a concise 5‑sentence summary of the following {item_type}.
+    prompt = f"""You are a scientific summariser. Write a concise summary of the following {item_type}.
 
 {item_type.capitalize()} details:
 Title: {title}
@@ -213,7 +244,7 @@ Last author (lab): {last_author if last_author else "N/A"}
 Abstract: {abstract[:1500]}
 
 Rules:
-- Provide exactly 5 sentences.
+- Provide a concise, informative summary – aim for 4‑6 sentences, but use your judgment.
 - Capture key findings, significance, and context.
 - Preserve ambiguous terms verbatim – do not guess.
 - If you cannot determine meaning, err on the side of inclusion.
@@ -239,7 +270,6 @@ Rules:
 # =============================================================================
 
 def fetch_top_posts(subreddit, max_posts=3, days_back=7):
-    """Fetch top posts from the last `days_back` days for a subreddit."""
     if not APIFY_API_KEY:
         logger.error("APIFY_API secret not set")
         return []
@@ -344,15 +374,14 @@ def main():
         logger.info("Already sent today – skipping.")
         return
 
-    # Rotation
-    day_index = now.weekday()          # 0=Monday, 6=Sunday
-    term_idx = day_index % len(TERMS)
-    sub_idx = day_index % len(SUBREDDITS)
+    # --- Rotation using persistent indices ---
+    term_idx = get_next_index(TERM_INDEX_FILE, len(TERMS))
+    sub_idx = get_next_index(SUBREDDIT_INDEX_FILE, len(SUBREDDITS))
     term_name = TERMS[term_idx]
-    term_query = TERMS[term_idx]       # same string, may contain quotes/OR
+    term_query = TERMS[term_idx]
     subreddit = SUBREDDITS[sub_idx]
 
-    logger.info(f"Today: term='{term_name}', subreddit='{subreddit}'")
+    logger.info(f"Today: term='{term_name}' (index {term_idx}), subreddit='{subreddit}' (index {sub_idx})")
 
     # --- 1. Reddit: top post from last M days (M = number of subreddits) ---
     M = len(SUBREDDITS)
@@ -474,6 +503,11 @@ def main():
     full_message = "\n".join(lines).strip()
     send_telegram(full_message)
     mark_sent_today()
+
+    # Increment indices for next day
+    increment_index(TERM_INDEX_FILE, len(TERMS))
+    increment_index(SUBREDDIT_INDEX_FILE, len(SUBREDDITS))
+
     logger.info("Digest sent successfully.")
 
 if __name__ == "__main__":
