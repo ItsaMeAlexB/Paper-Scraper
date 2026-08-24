@@ -378,7 +378,8 @@ def main():
     term_idx = get_next_index(TERM_INDEX_FILE, len(TERMS))
     sub_idx = get_next_index(SUBREDDIT_INDEX_FILE, len(SUBREDDITS))
     term_name = TERMS[term_idx]
-    term_query = TERMS[term_idx]
+    # IMPORTANT: wrap the term in quotes for PubMed phrase search
+    term_query = f'"{TERMS[term_idx]}"'
     subreddit = SUBREDDITS[sub_idx]
 
     logger.info(f"Today: term='{term_name}' (index {term_idx}), subreddit='{subreddit}' (index {sub_idx})")
