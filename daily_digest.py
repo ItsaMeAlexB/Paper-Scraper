@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import logging
+import traceback
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -70,27 +71,33 @@ def load_config():
 TERMS, SUBREDDITS, AUTHORS = load_config()
 AUTHOR_QUERIES = [f'"{a}"[AU]' for a in AUTHORS]
 
+logger.info(f"Loaded {len(TERMS)} terms, {len(SUBREDDITS)} subreddits, {len(AUTHORS)} authors")
+
 # =============================================================================
 # INDEX MANAGEMENT
 # =============================================================================
 
 def read_index(file_path):
     if not os.path.exists(file_path):
+        logger.info(f"Index file {file_path} not found, starting at 0")
         return 0
     try:
         with open(file_path, "r") as f:
             return int(f.read().strip())
-    except:
+    except Exception as e:
+        logger.warning(f"Could not read {file_path}: {e}, resetting to 0")
         return 0
 
 def write_index(file_path, value):
     with open(file_path, "w") as f:
         f.write(str(value))
+    logger.debug(f"Wrote {value} to {file_path}")
 
 def get_next_index(file_path, max_val):
     idx = read_index(file_path)
     if idx >= max_val:
         idx = 0
+    logger.info(f"Current index from {file_path}: {idx}")
     return idx
 
 def increment_index(file_path, max_val):
@@ -98,6 +105,7 @@ def increment_index(file_path, max_val):
     if idx >= max_val:
         idx = 0
     write_index(file_path, idx)
+    logger.info(f"Incremented {file_path} to {idx}")
 
 # =============================================================================
 # PEAK PRICING
@@ -125,6 +133,7 @@ def is_within_buffer_of_peak(dt, buffer_minutes):
 
 def should_run():
     now = datetime.now(timezone.utc)
+    logger.info(f"Peak check at {now.strftime('%H:%M')} UTC")
     if is_deepseek_peak_time(now):
         return False, f"Inside peak window (UTC {now.strftime('%H:%M')})"
     if is_within_buffer_of_peak(now, PEAK_BUFFER_MINUTES):
@@ -136,6 +145,7 @@ def should_run():
 # =============================================================================
 
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
+    logger.info(f"Querying PubMed: '{query}' from {start_date} to {end_date}")
     Entrez.email = ENTREZ_EMAIL
     start_str = start_date.strftime("%Y/%m/%d")
     end_str = end_date.strftime("%Y/%m/%d")
@@ -156,6 +166,7 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
         if retstart >= int(record["Count"]) or retstart >= max_results:
             break
         time.sleep(0.3)
+    logger.info(f"Found {len(pmids)} PMIDs")
     return pmids
 
 def fetch_metadata(pmids):
@@ -190,6 +201,7 @@ def fetch_metadata(pmids):
             "date": rec.get("DP", ""),
             "pmid": rec.get("PMID", ""),
         })
+    logger.info(f"Fetched metadata for {len(papers)} papers")
     return papers
 
 # =============================================================================
@@ -199,7 +211,9 @@ def fetch_metadata(pmids):
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def deepseek_select_title(term_name, papers):
+    logger.info(f"Selecting title for term '{term_name}' from {len(papers)} papers")
     if not papers:
+        logger.warning("No papers to select from")
         return None
     titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(papers)])
     prompt = f"""From the following list of titles for the topic "{term_name}", pick the 1 most useful paper based on its title.
@@ -228,13 +242,17 @@ If the list is empty, return "NO_TITLES".
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"].strip()
         if content and content != "NO_TITLES":
+            logger.info(f"DeepSeek selected title: {content}")
             return content
-        return None
+        else:
+            logger.warning("DeepSeek returned NO_TITLES or empty")
+            return None
     except Exception as e:
-        logger.error(f"Selection error for {term_name}: {e}")
+        logger.error(f"Selection error: {e}")
         return papers[0]['title'] if papers else None
 
 def deepseek_summarize_single(title, abstract, journal, last_author, item_type="paper"):
+    logger.debug(f"Summarizing {item_type}: {title[:50]}...")
     prompt = f"""You are a scientific summariser. Write a concise summary of the following {item_type}.
 
 {item_type.capitalize()} details:
@@ -260,7 +278,9 @@ Rules:
     try:
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        summary = resp.json()["choices"][0]["message"]["content"].strip()
+        logger.debug(f"Summary generated: {summary[:100]}...")
+        return summary
     except Exception as e:
         logger.error(f"Summarisation error: {e}")
         return "⚠️ Summary generation failed."
@@ -270,6 +290,7 @@ Rules:
 # =============================================================================
 
 def fetch_top_posts(subreddit, max_posts=3, days_back=7):
+    logger.info(f"Fetching top {max_posts} posts from r/{subreddit} (last {days_back} days)")
     if not APIFY_API_KEY:
         logger.error("APIFY_API secret not set")
         return []
@@ -291,12 +312,14 @@ def fetch_top_posts(subreddit, max_posts=3, days_back=7):
         run = client.actor("harshmaur/reddit-scraper").call(run_input=run_input)
         items = list(client.dataset(run.default_dataset_id).iterate_items())
         posts = [i for i in items if i.get("dataType") == "post"]
+        logger.info(f"Retrieved {len(posts)} posts")
         return posts
     except Exception as e:
         logger.error(f"Reddit fetch error: {e}")
         return []
 
 def fetch_top_comment(post_url):
+    logger.info(f"Fetching top comment from {post_url}")
     if not post_url:
         return None
     client = ApifyClient(APIFY_API_KEY)
@@ -313,7 +336,10 @@ def fetch_top_comment(post_url):
         comments = [i for i in items if i.get("dataType") == "comment"]
         if comments:
             comments.sort(key=lambda c: c.get("upVotes") or 0, reverse=True)
-            return comments[0]
+            top = comments[0]
+            logger.info(f"Retrieved top comment with score {top.get('upVotes') or 0}")
+            return top
+        logger.info("No comments found")
         return None
     except Exception as e:
         logger.error(f"Comment fetch error: {e}")
@@ -346,170 +372,200 @@ def send_telegram(message):
 
 def has_sent_today():
     if not os.path.exists(LAST_SENT_FILE):
+        logger.info("No last_sent_date file, first run of the day")
         return False
     try:
         with open(LAST_SENT_FILE, "r") as f:
             last = f.read().strip()
-        return last == datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    except:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if last == today:
+            logger.info(f"Already sent today ({today})")
+            return True
+        else:
+            logger.info(f"Last sent on {last}, today is {today}")
+            return False
+    except Exception as e:
+        logger.warning(f"Could not read last_sent_date: {e}")
         return False
 
 def mark_sent_today():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with open(LAST_SENT_FILE, "w") as f:
-        f.write(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        f.write(today)
+    logger.info(f"Marked sent for {today}")
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
-    ok, reason = should_run()
-    now = datetime.now(timezone.utc)
-    logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    if not ok:
-        logger.info(f"Skipping: {reason}")
-        return
+    try:
+        ok, reason = should_run()
+        now = datetime.now(timezone.utc)
+        logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        if not ok:
+            logger.info(f"Skipping: {reason}")
+            return
 
-    if has_sent_today():
-        logger.info("Already sent today – skipping.")
-        return
+        if has_sent_today():
+            logger.info("Skipping duplicate run")
+            return
 
-    # --- Rotation using persistent indices ---
-    term_idx = get_next_index(TERM_INDEX_FILE, len(TERMS))
-    sub_idx = get_next_index(SUBREDDIT_INDEX_FILE, len(SUBREDDITS))
-    term_name = TERMS[term_idx]
-    # IMPORTANT: wrap the term in quotes for PubMed phrase search
-    term_query = f'"{TERMS[term_idx]}"'
-    subreddit = SUBREDDITS[sub_idx]
+        # --- Rotation using persistent indices ---
+        term_idx = get_next_index(TERM_INDEX_FILE, len(TERMS))
+        sub_idx = get_next_index(SUBREDDIT_INDEX_FILE, len(SUBREDDITS))
+        term_name = TERMS[term_idx]
+        term_query = f'"{TERMS[term_idx]}"'  # quoted for phrase search
+        subreddit = SUBREDDITS[sub_idx]
 
-    logger.info(f"Today: term='{term_name}' (index {term_idx}), subreddit='{subreddit}' (index {sub_idx})")
+        logger.info(f"Selected term[{term_idx}]='{term_name}', subreddit[{sub_idx}]='{subreddit}'")
 
-    # --- 1. Reddit: top post from last M days (M = number of subreddits) ---
-    M = len(SUBREDDITS)
-    posts = fetch_top_posts(subreddit, max_posts=3, days_back=M)
-    valid_post = None
-    for p in posts:
-        if len(p.get("body", "") or "") > 0:
-            valid_post = p
-            break
+        # --- 1. Reddit: top post from last M days ---
+        M = len(SUBREDDITS)
+        posts = fetch_top_posts(subreddit, max_posts=3, days_back=M)
+        # Sort by upvotes descending
+        posts_sorted = sorted(posts, key=lambda p: p.get("upVotes") or p.get("score") or 0, reverse=True)
+        valid_post = None
+        for p in posts_sorted:
+            body = p.get("body", "") or ""
+            if len(body) > 0:
+                valid_post = p
+                logger.info(f"Selected post: '{p.get('title')}' with {p.get('upVotes') or 0} upvotes")
+                break
+        if not valid_post:
+            logger.warning("No post with body content found")
 
-    reddit_entry = None
-    comment = None
-    if valid_post:
-        post_url = valid_post.get("postUrl") or valid_post.get("url")
-        if post_url:
-            comment = fetch_top_comment(post_url)
-        reddit_entry = {
-            "title": valid_post.get("title", "No title"),
-            "upvotes": valid_post.get("upVotes") or valid_post.get("score") or 0,
-            "subreddit": subreddit,
-            "body": valid_post.get("body", ""),
-            "url": post_url,
-            "comment": comment["body"] if comment else None
-        }
+        reddit_entry = None
+        comment = None
+        if valid_post:
+            post_url = valid_post.get("postUrl") or valid_post.get("url")
+            if post_url:
+                comment = fetch_top_comment(post_url)
+            reddit_entry = {
+                "title": valid_post.get("title", "No title"),
+                "upvotes": valid_post.get("upVotes") or valid_post.get("score") or 0,
+                "subreddit": subreddit,
+                "body": valid_post.get("body", ""),
+                "url": post_url,
+                "comment": comment["body"] if comment else None
+            }
 
-    # --- 2. PubMed: papers for term from last N days (N = number of terms) ---
-    N = len(TERMS)
-    start_date = now - timedelta(days=N)
-    pmids = fetch_all_pmids(term_query, start_date, now)
-    papers = fetch_metadata(pmids) if pmids else []
-    logger.info(f"Found {len(papers)} papers for term '{term_name}'.")
+        # --- 2. PubMed: papers for term from last N days ---
+        N = len(TERMS)
+        start_date = now - timedelta(days=N)
+        pmids = fetch_all_pmids(term_query, start_date, now)
+        papers = fetch_metadata(pmids) if pmids else []
+        logger.info(f"Found {len(papers)} papers for term '{term_name}'.")
 
-    selected_paper = None
-    if papers:
-        selected_title = deepseek_select_title(term_name, papers)
-        if selected_title:
-            for p in papers:
-                if p["title"].strip().lower() == selected_title.lower():
-                    selected_paper = p
-                    break
-            if not selected_paper:
+        selected_paper = None
+        if papers:
+            selected_title = deepseek_select_title(term_name, papers)
+            if selected_title:
+                for p in papers:
+                    if p["title"].strip().lower() == selected_title.lower():
+                        selected_paper = p
+                        logger.info(f"Matched selected paper: {p['title']}")
+                        break
+                if not selected_paper:
+                    logger.warning("Could not match selected title, using first paper")
+                    selected_paper = papers[0]
+            else:
+                logger.warning("No title selected, using first paper")
                 selected_paper = papers[0]
+        else:
+            logger.warning("No papers found for this term")
 
-    # --- 3. Named authors: last 1 day ---
-    named_papers = []
-    for auth_q in AUTHOR_QUERIES:
-        auth_pmids = fetch_all_pmids(auth_q, now - timedelta(days=1), now)
-        if auth_pmids:
-            auth_papers = fetch_metadata(auth_pmids)
-            named_papers.extend(auth_papers)
+        # --- 3. Named authors: last 1 day ---
+        named_papers = []
+        for auth_q in AUTHOR_QUERIES:
+            auth_pmids = fetch_all_pmids(auth_q, now - timedelta(days=1), now)
+            if auth_pmids:
+                auth_papers = fetch_metadata(auth_pmids)
+                named_papers.extend(auth_papers)
 
-    # deduplicate against selected
-    if selected_paper:
-        sel_doi = selected_paper.get("doi")
-        sel_pmid = selected_paper.get("pmid")
-        named_papers = [p for p in named_papers if p.get("doi") != sel_doi and p.get("pmid") != sel_pmid]
+        # deduplicate against selected
+        if selected_paper:
+            sel_doi = selected_paper.get("doi")
+            sel_pmid = selected_paper.get("pmid")
+            named_papers = [p for p in named_papers if p.get("doi") != sel_doi and p.get("pmid") != sel_pmid]
+        logger.info(f"Found {len(named_papers)} named-author papers (after dedup)")
 
-    # --- 4. Build message ---
-    lines = []
+        # --- 4. Build message ---
+        lines = []
 
-    # Reddit
-    if reddit_entry:
-        summary = deepseek_summarize_single(
-            title=reddit_entry["title"],
-            abstract=reddit_entry["body"][:1500],
-            journal="Reddit",
-            last_author="",
-            item_type="subreddit post"
-        )
-        lines.append(f"Reddit Post: {reddit_entry['title']}")
-        lines.append(f"Upvotes: {reddit_entry['upvotes']}  |  Subreddit: r/{reddit_entry['subreddit']}")
-        lines.append(f"Summary: {summary}")
-        if reddit_entry.get("comment"):
-            comment_summary = deepseek_summarize_single(
-                title="Top Comment",
-                abstract=reddit_entry["comment"][:1500],
+        # Reddit
+        if reddit_entry:
+            summary = deepseek_summarize_single(
+                title=reddit_entry["title"],
+                abstract=reddit_entry["body"][:1500],
                 journal="Reddit",
                 last_author="",
-                item_type="comment"
+                item_type="subreddit post"
             )
-            lines.append(f"Top Comment: {comment_summary}")
-        lines.append("")
+            lines.append(f"Reddit Post: {reddit_entry['title']}")
+            lines.append(f"Upvotes: {reddit_entry['upvotes']}  |  Subreddit: r/{reddit_entry['subreddit']}")
+            lines.append(f"Summary: {summary}")
+            if reddit_entry.get("comment"):
+                comment_summary = deepseek_summarize_single(
+                    title="Top Comment",
+                    abstract=reddit_entry["comment"][:1500],
+                    journal="Reddit",
+                    last_author="",
+                    item_type="comment"
+                )
+                lines.append(f"Top Comment: {comment_summary}")
+            lines.append("")
 
-    # Selected paper
-    if selected_paper:
-        last_author = selected_paper['authors'][-1] if selected_paper.get('authors') else "Unknown"
-        journal = selected_paper.get('journal', "Unknown")
-        summary = deepseek_summarize_single(
-            title=selected_paper['title'],
-            abstract=selected_paper.get('abstract', ""),
-            journal=journal,
-            last_author=last_author,
-            item_type="paper"
-        )
-        lines.append(f"Paper: {selected_paper['title']}")
-        lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
-        lines.append(f"Summary: {summary}")
-        lines.append("")
+        # Selected paper
+        if selected_paper:
+            last_author = selected_paper['authors'][-1] if selected_paper.get('authors') else "Unknown"
+            journal = selected_paper.get('journal', "Unknown")
+            summary = deepseek_summarize_single(
+                title=selected_paper['title'],
+                abstract=selected_paper.get('abstract', ""),
+                journal=journal,
+                last_author=last_author,
+                item_type="paper"
+            )
+            lines.append(f"Paper: {selected_paper['title']}")
+            lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
+            lines.append(f"Summary: {summary}")
+            lines.append("")
 
-    # Named author papers
-    for p in named_papers:
-        last_author = p['authors'][-1] if p.get('authors') else "Unknown"
-        journal = p.get('journal', "Unknown")
-        summary = deepseek_summarize_single(
-            title=p['title'],
-            abstract=p.get('abstract', ""),
-            journal=journal,
-            last_author=last_author,
-            item_type="paper"
-        )
-        lines.append(f"Named Author Paper: {p['title']}")
-        lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
-        lines.append(f"Summary: {summary}")
-        lines.append("")
+        # Named author papers
+        for p in named_papers:
+            last_author = p['authors'][-1] if p.get('authors') else "Unknown"
+            journal = p.get('journal', "Unknown")
+            summary = deepseek_summarize_single(
+                title=p['title'],
+                abstract=p.get('abstract', ""),
+                journal=journal,
+                last_author=last_author,
+                item_type="paper"
+            )
+            lines.append(f"Named Author Paper: {p['title']}")
+            lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
+            lines.append(f"Summary: {summary}")
+            lines.append("")
 
-    if not lines:
-        lines = ["No content available today."]
+        if not lines:
+            lines = ["No content available today."]
 
-    full_message = "\n".join(lines).strip()
-    send_telegram(full_message)
-    mark_sent_today()
+        full_message = "\n".join(lines).strip()
+        logger.info(f"Prepared message with {len(lines)} sections")
+        send_telegram(full_message)
+        mark_sent_today()
 
-    # Increment indices for next day
-    increment_index(TERM_INDEX_FILE, len(TERMS))
-    increment_index(SUBREDDIT_INDEX_FILE, len(SUBREDDITS))
+        # Increment indices for next day
+        increment_index(TERM_INDEX_FILE, len(TERMS))
+        increment_index(SUBREDDIT_INDEX_FILE, len(SUBREDDITS))
 
-    logger.info("Digest sent successfully.")
+        logger.info("Digest sent successfully.")
+
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 if __name__ == "__main__":
     main()
