@@ -251,18 +251,17 @@ If the list is empty, return "NO_TITLES".
         logger.error(f"Selection error: {e}")
         return papers[0]['title'] if papers else None
 
-def deepseek_summarize_single(title, abstract, journal, last_author, item_type="paper"):
-    logger.debug(f"Summarizing {item_type}: {title[:50]}...")
-    prompt = f"""You are a scientific summariser. Write a concise summary of the following {item_type}.
+def deepseek_summarize_paper(title, abstract, journal, last_author):
+    prompt = f"""You are a scientific summariser. Write a concise summary of the following paper in exactly 4 sentences.
 
-{item_type.capitalize()} details:
+Paper details:
 Title: {title}
 Journal: {journal}
 Last author (lab): {last_author if last_author else "N/A"}
 Abstract: {abstract[:1500]}
 
 Rules:
-- Provide a concise, informative summary – aim for 4‑6 sentences, but use your judgment.
+- Exactly 4 sentences.
 - Capture key findings, significance, and context.
 - Preserve ambiguous terms verbatim – do not guess.
 - If you cannot determine meaning, err on the side of inclusion.
@@ -272,38 +271,72 @@ Rules:
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 500,
+        "max_tokens": 400,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
     try:
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
-        summary = resp.json()["choices"][0]["message"]["content"].strip()
-        logger.debug(f"Summary generated: {summary[:100]}...")
-        return summary
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"Summarisation error: {e}")
+        logger.error(f"Paper summarisation error: {e}")
+        return "⚠️ Summary generation failed."
+
+def deepseek_summarize_reddit(title, body, subreddit, upvotes, comment_body, comment_upvotes):
+    prompt = f"""You are a scientific summariser. Write a concise summary of the following Reddit post and its top comment in exactly 4 sentences.
+
+Reddit post details:
+Title: {title}
+Subreddit: r/{subreddit}
+Upvotes: {upvotes}
+Post body: {body}
+Top comment: {comment_body}
+Top comment upvotes: {comment_upvotes}
+
+Rules:
+- Exactly 4 sentences.
+- Summarise the main question, discussion, or insight.
+- Include the context of the post and the key point from the top comment.
+- Preserve ambiguous terms verbatim – do not guess.
+- If you cannot determine meaning, err on the side of inclusion.
+- Output only the summary text, nothing else.
+"""
+    payload = {
+        "model": "deepseek-v4-flash",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 400,
+    }
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    try:
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"Reddit summarisation error: {e}")
         return "⚠️ Summary generation failed."
 
 # =============================================================================
 # REDDIT (harshmaur/reddit-scraper)
 # =============================================================================
 
-def fetch_top_posts(subreddit, max_posts=3, days_back=7):
-    logger.info(f"Fetching top {max_posts} posts from r/{subreddit} (last {days_back} days)")
+def fetch_top_posts(subreddit, days_back=7, max_posts=50):
+    logger.info(f"Fetching top posts from r/{subreddit} for the last {days_back} days")
     if not APIFY_API_KEY:
         logger.error("APIFY_API secret not set")
         return []
     client = ApifyClient(APIFY_API_KEY)
-    now = datetime.now(timezone.utc)
-    posted_after = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    posted_before = now.strftime("%Y-%m-%d")
-    url = f"https://www.reddit.com/r/{subreddit}/top/"
+
+    # Determine time filter based on days_back
+    if days_back <= 7:
+        time_filter = "week"
+    else:
+        time_filter = "month"
+    url = f"https://www.reddit.com/r/{subreddit}/top/?t={time_filter}"
+
     run_input = {
         "startUrls": [{"url": url}],
         "maxPostsCount": max_posts,
-        "postedAfter": posted_after,
-        "postedBefore": posted_before,
         "crawlCommentsPerPost": False,
         "includeNSFW": False,
         "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
@@ -312,7 +345,7 @@ def fetch_top_posts(subreddit, max_posts=3, days_back=7):
         run = client.actor("harshmaur/reddit-scraper").call(run_input=run_input)
         items = list(client.dataset(run.default_dataset_id).iterate_items())
         posts = [i for i in items if i.get("dataType") == "post"]
-        logger.info(f"Retrieved {len(posts)} posts")
+        logger.info(f"Retrieved {len(posts)} raw posts")
         return posts
     except Exception as e:
         logger.error(f"Reddit fetch error: {e}")
@@ -400,6 +433,7 @@ def mark_sent_today():
 
 def main():
     try:
+        # 1. Peak check
         ok, reason = should_run()
         now = datetime.now(timezone.utc)
         logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -407,6 +441,7 @@ def main():
             logger.info(f"Skipping: {reason}")
             return
 
+        # 2. Daily sent check
         if has_sent_today():
             logger.info("Skipping duplicate run")
             return
@@ -422,18 +457,33 @@ def main():
 
         # --- 1. Reddit: top post from last M days ---
         M = len(SUBREDDITS)
-        posts = fetch_top_posts(subreddit, max_posts=3, days_back=M)
+        posts = fetch_top_posts(subreddit, days_back=M, max_posts=50)
+        # Filter to last M days (keep only posts newer than M days ago)
+        cutoff = now - timedelta(days=M)
+        filtered = []
+        for p in posts:
+            created_str = p.get("createdAt")
+            if not created_str:
+                continue
+            try:
+                # Handle various formats: sometimes it's like "2026-08-28T19:26:27.000Z"
+                created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+                if created >= cutoff:
+                    filtered.append(p)
+            except Exception as e:
+                logger.warning(f"Could not parse date {created_str}: {e}")
+                continue
         # Sort by upvotes descending
-        posts_sorted = sorted(posts, key=lambda p: p.get("upVotes") or p.get("score") or 0, reverse=True)
+        filtered.sort(key=lambda p: p.get("upVotes") or p.get("score") or 0, reverse=True)
         valid_post = None
-        for p in posts_sorted:
+        for p in filtered:
             body = p.get("body", "") or ""
             if len(body) > 0:
                 valid_post = p
                 logger.info(f"Selected post: '{p.get('title')}' with {p.get('upVotes') or 0} upvotes")
                 break
         if not valid_post:
-            logger.warning("No post with body content found")
+            logger.warning("No post with body content found in the last M days")
 
         reddit_entry = None
         comment = None
@@ -447,7 +497,10 @@ def main():
                 "subreddit": subreddit,
                 "body": valid_post.get("body", ""),
                 "url": post_url,
-                "comment": comment["body"] if comment else None
+                "author": valid_post.get("authorName", "unknown"),
+                "comment": comment["body"] if comment else None,
+                "comment_upvotes": comment.get("upVotes") or 0 if comment else None,
+                "comment_author": comment.get("authorName", "unknown") if comment else None
             }
 
         # --- 2. PubMed: papers for term from last N days ---
@@ -495,39 +548,32 @@ def main():
 
         # Reddit
         if reddit_entry:
-            summary = deepseek_summarize_single(
+            summary = deepseek_summarize_reddit(
                 title=reddit_entry["title"],
-                abstract=reddit_entry["body"][:1500],
-                journal="Reddit",
-                last_author="",
-                item_type="subreddit post"
+                body=reddit_entry["body"][:1500],
+                subreddit=reddit_entry["subreddit"],
+                upvotes=reddit_entry["upvotes"],
+                comment_body=reddit_entry["comment"][:1500] if reddit_entry.get("comment") else "",
+                comment_upvotes=reddit_entry.get("comment_upvotes") or 0
             )
             lines.append(f"Reddit Post: {reddit_entry['title']}")
-            lines.append(f"Upvotes: {reddit_entry['upvotes']}  |  Subreddit: r/{reddit_entry['subreddit']}")
-            lines.append(f"Summary: {summary}")
+            lines.append(f"Subreddit: r/{reddit_entry['subreddit']}  |  Upvotes: {reddit_entry['upvotes']}  |  Author: {reddit_entry.get('author', 'unknown')}")
             if reddit_entry.get("comment"):
-                comment_summary = deepseek_summarize_single(
-                    title="Top Comment",
-                    abstract=reddit_entry["comment"][:1500],
-                    journal="Reddit",
-                    last_author="",
-                    item_type="comment"
-                )
-                lines.append(f"Top Comment: {comment_summary}")
+                lines.append(f"Top Comment (upvotes: {reddit_entry['comment_upvotes']}) by {reddit_entry.get('comment_author', 'unknown')}")
+            lines.append(f"Summary: {summary}")
             lines.append("")
 
         # Selected paper
         if selected_paper:
             last_author = selected_paper['authors'][-1] if selected_paper.get('authors') else "Unknown"
             journal = selected_paper.get('journal', "Unknown")
-            summary = deepseek_summarize_single(
+            summary = deepseek_summarize_paper(
                 title=selected_paper['title'],
                 abstract=selected_paper.get('abstract', ""),
                 journal=journal,
-                last_author=last_author,
-                item_type="paper"
+                last_author=last_author
             )
-            lines.append(f"Paper: {selected_paper['title']}")
+            lines.append(f"Paper (Term: {term_name}): {selected_paper['title']}")
             lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
             lines.append(f"Summary: {summary}")
             lines.append("")
@@ -536,12 +582,11 @@ def main():
         for p in named_papers:
             last_author = p['authors'][-1] if p.get('authors') else "Unknown"
             journal = p.get('journal', "Unknown")
-            summary = deepseek_summarize_single(
+            summary = deepseek_summarize_paper(
                 title=p['title'],
                 abstract=p.get('abstract', ""),
                 journal=journal,
-                last_author=last_author,
-                item_type="paper"
+                last_author=last_author
             )
             lines.append(f"Named Author Paper: {p['title']}")
             lines.append(f"Lab: {last_author} Lab  |  Journal: {journal}")
