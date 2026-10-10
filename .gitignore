@@ -1,0 +1,13 @@
+# Secrets — never commit real credentials
+.env
+
+# Runtime state
+last_sent_date.txt
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
