@@ -188,25 +188,33 @@ def fetch_metadata(pmids):
 # =============================================================================
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-# Official DeepSeek model ids (api.deepseek.com). "deepseek-flash" is the current
-# name for DeepSeek-V4.1-Flash; "deepseek-v4-flash" is a retired legacy alias.
-DEEPSEEK_MODEL = "deepseek-flash"
-# Small/fast models lose JSON structure on very long lists (e.g. 129 titles),
-# so we only score the most-recent N papers (PubMed is already recent-first).
-SCORE_MAX_PAPERS = 30
+# Non-reasoning model: no chain-of-thought tokens competing with the answer,
+# so structured JSON output is reliable for large batched scoring.
+DEEPSEEK_MODEL = "deepseek-chat"
+# [rel, sig] pairs are ~5-7 tokens each; this budget comfortably covers very
+# large batches (hundreds of papers) with headroom.
+SCORE_MAX_TOKENS = 16000
 
-def _score_papers(term_name, papers, prompt, api_key, url, model):
+def _score_papers(papers, prompt, api_key, url, model):
     """Ask the model to score each paper; returns list of (relevance, significance)."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
-        "max_tokens": 2000,
+        "max_tokens": SCORE_MAX_TOKENS,
     }
     resp = requests.post(url, json=payload, headers=headers, timeout=240)
     resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"].strip()
+    data = resp.json()
+    choice = data["choices"][0]
+    msg = choice["message"]
+    content = (msg.get("content") or "").strip()
+    if not content:
+        raise ValueError(
+            f"empty content from model "
+            f"(finish_reason={choice.get('finish_reason')}, usage={data.get('usage')})"
+        )
     # Model may wrap the JSON in fences or prose; extract the first JSON array.
     start = content.find("[")
     end = content.rfind("]")
@@ -236,31 +244,26 @@ def deepseek_select_title(term_name, papers):
     """
     if not papers:
         return None, None
-    capped = papers if len(papers) <= SCORE_MAX_PAPERS else papers[:SCORE_MAX_PAPERS]
-    if len(capped) < len(papers):
-        logger.info(
-            f"Scoring only first {len(capped)} of {len(papers)} papers to stay within model limits"
-        )
-    titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(capped)])
+    titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(papers)])
     prompt = f"""You are scoring papers for a researcher who reads primary sources.
 
 For each title below (topic: "{term_name}"), output exactly one JSON array of
 [relevance, significance] pairs, in the SAME order as the titles, nothing else.
 
 Scoring rules (each score is an integer 0-10):
-- relevance: how directly the paper is about "{term_name}" itself (not just using it as a tool, not mentioning it in passing).
+- relevance: how directly the paper is about "{term_name}" itself (not just using it as a tool, not mentioning it in passing), AND how directly it pertains to humans, human cells, or preclinical/clinical work in humans. Purely plant, bacterial, or non-human-organism work scores low here unless clearly translational to humans.
 - significance: how much the paper advances the field (new data, new method, new model, or a landmark benchmark/meta-analysis).
 - If the paper is NOT a primary source (narrative review, topical/opinion review, "review of", perspective, editorial, highlight, news, commentary), set BOTH scores to 0.
 
 Titles:
 {titles_text}
 
-Return only a JSON array like [[rel,sig],[rel,sig],...] with exactly {len(capped)} entries, one per title, in order. No prose, no code fences.
+Return only a JSON array like [[rel,sig],[rel,sig],...] with exactly {len(papers)} entries, one per title, in order. No prose, no code fences.
 """
     if not DEEPSEEK_API_KEY:
         return papers[0]['title'], "DEEPSEEK_API_KEY not set; used first paper"
     try:
-        scores = _score_papers(term_name, capped, prompt, DEEPSEEK_API_KEY, DEEPSEEK_URL, DEEPSEEK_MODEL)
+        scores = _score_papers(papers, prompt, DEEPSEEK_API_KEY, DEEPSEEK_URL, DEEPSEEK_MODEL)
     except Exception as e:
         logger.error(f"DeepSeek scoring error: {e}")
         return papers[0]['title'], f"DeepSeek scoring error ({e}); used first paper"
@@ -271,11 +274,11 @@ Return only a JSON array like [[rel,sig],[rel,sig],...] with exactly {len(capped
     winners = [i for i, p in enumerate(products) if p == best]
     idx = random.choice(winners)
     logger.info(
-        f"DeepSeek scored {len(capped)} papers; winner #{idx+1} "
+        f"DeepSeek scored {len(papers)} papers; winner #{idx+1} "
         f"(rel={scores[idx][0]}, sig={scores[idx][1]}, product={best}, tied={len(winners)}): "
-        f"{capped[idx]['title']}"
+        f"{papers[idx]['title']}"
     )
-    return capped[idx]['title'], None
+    return papers[idx]['title'], None
 
 # =============================================================================
 # REDDIT (harshmaur/reddit-scraper)
