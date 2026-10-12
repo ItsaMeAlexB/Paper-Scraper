@@ -251,9 +251,8 @@ For each title below (topic: "{term_name}"), output exactly one JSON array of
 [relevance, significance] pairs, in the SAME order as the titles, nothing else.
 
 Scoring rules (each score is an integer 0-10):
-- relevance: how directly the paper is about "{term_name}" itself (not just using it as a tool, not mentioning it in passing), AND how directly it pertains to humans, human cells, or preclinical/clinical work in humans. Purely plant, bacterial, or non-human-organism work scores low here unless clearly translational to humans.
-- significance: how much the paper advances the field (new data, new method, new model, or a landmark benchmark/meta-analysis).
-- If the paper is NOT a primary source (narrative review, topical/opinion review, "review of", perspective, editorial, highlight, news, commentary), set BOTH scores to 0.
+- relevance: how directly the paper is about "{term_name}" itself (not just using it as a tool, not mentioning it in passing), AND how directly it pertains to humans, human cells, or preclinical/clinical work in humans. Non-human-organism work scores low here unless understood as translational to humans.
+- significance: how much the paper advances the field (new data, new method, new model, or a landmark benchmark/meta-analysis). If the paper is NOT a primary source (narrative review, topical/opinion review, perspective, editorial, highlight, news, commentary), it scores lowely on significance.
 
 Titles:
 {titles_text}
