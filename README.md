@@ -50,15 +50,30 @@ link — so the link can be copied into the RSVP app with a single tap:
 4. `<post title>, r/<subreddit>, <upvotes> upvotes, u/<author>`
 5. `<post URL>`
 
-No summaries. The only decision delegated to an LLM is *which* paper title to
-pick from the day's list — everything else is mechanical.
+No summaries. LLM decisions here are limited to *which* title wins (ranking and
+novelty) — everything else is mechanical.
 
 ## Selection rules (paper)
 
 PubMed returns every paper matching the day's term from the last **7 days**
 (the term's rotation period, so nothing is missed between its weekly visits).
-DeepSeek then picks the single best title, biased toward:
+Selection then runs in four stages:
 
+1. **Rank** — DeepSeek scores every title on relevance and significance (rules
+   below); the top 5 by the relevance×significance product are kept.
+2. **Condense** — DeepSeek rewrites each of those 5 titles as a short generic
+   "what the paper did" phrase (e.g. *"a model designed to predict large serine
+   recombinase off-targets"*, *"a lipid nanoparticle formulated to avoid hepatic
+   accumulation"*).
+3. **Check the literature** — each phrase is searched against all of PubMed
+   (best-match, all-time); the 5 most similar existing titles are collected.
+   This is what reveals papers that are significant and relevant but **not
+   actually new**.
+4. **Judge novelty** — each top paper is shown alongside its similar papers and
+   DeepSeek scores only its *novelty* (0–10). The most novel of the 5 wins
+   (ties by relevance×significance, then at random).
+
+Ranking favors:
 1. **Primary research** — new experimental data, a new method, model, or
    benchmark that advances the field.
 2. **Meta-analyses / systematic reviews** of primary data are acceptable and
@@ -69,8 +84,9 @@ DeepSeek then picks the single best title, biased toward:
 Explicitly excluded: narrative/topical reviews, perspectives, editorials,
 highlights, news, and commentary.
 
-**Fallback:** if DeepSeek is out of credit or down, the script silently uses
-the first paper in the list, so the digest still goes out.
+**Fallback:** any DeepSeek or PubMed failure above silently falls back to the
+stage-1 top-ranked paper (or, if scoring itself fails, the first paper in the
+list), so the digest still goes out.
 
 ## Selection rules (Reddit)
 
@@ -82,7 +98,8 @@ rotation).
 
 ## Failure handling
 
-- **DeepSeek down/out of credit** → fall back to the first paper; digest still sends.
+- **DeepSeek down/out of credit, or any ranking/condense/novelty step fails** → fall
+  back to the stage-1 top (or first) paper; digest still sends.
 - **Apify error** → Reddit section skipped; paper section still sends.
 - **PubMed returns zero papers** → paper section skipped; Reddit still sends.
 - **Telegram error** → logged and re-raised; run marked failed; nothing is
