@@ -194,17 +194,61 @@ DEEPSEEK_MODEL = "deepseek-chat"
 # [rel, sig] pairs are ~5-7 tokens each; this budget comfortably covers very
 # large batches (hundreds of papers) with headroom.
 SCORE_MAX_TOKENS = 16000
+TOP_N = 5  # how many top titles survive stage-1 ranking for the novelty check
+# Stage-1 scores one paper batch per call; large batches make deepseek-chat
+# truncate at max_tokens and abandon the [[rel,sig],...] format, so keep each
+# call small.
+SCORE_BATCH = 100
 
-def _score_papers(papers, prompt, api_key, url, model):
-    """Ask the model to score each paper; returns list of (relevance, significance)."""
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+def _extract_json_array(content, expected_len):
+    """Pull expected_len JSON entries out of model text. Pure.
+
+    1) Preferred: a single wrapping array of expected_len entries.
+    2) Fallback: consecutive standalone JSON values (e.g. newline-separated
+       [rel,sig] pairs) that deepseek-chat sometimes emits instead of one array.
+    """
+    start = content.find("[")
+    if start != -1:
+        end = content.rfind("]")
+        if end > start:
+            try:
+                arr = json.loads(content[start:end + 1])
+                if isinstance(arr, list) and len(arr) == expected_len:
+                    return arr
+            except ValueError:
+                pass
+    # Fallback: parse each standalone JSON value in order (unwrap 1-element
+    # sub-arrays like ["txt"] -> "txt").
+    dec = json.JSONDecoder()
+    out = []
+    i = content.find("[")
+    while i != -1 and len(out) < expected_len:
+        try:
+            val, idx = dec.raw_decode(content[i:])
+        except ValueError:
+            break
+        if isinstance(val, list) and len(val) == 1:
+            val = val[0]
+        out.append(val)
+        i = content.find("[", i + idx)
+    if len(out) == expected_len:
+        return out
+    raise ValueError(f"expected {expected_len} entries, got {len(out)} (content[:200]={content[:200]!r})")
+
+def _deepseek_json_array(prompt, expected_len):
+    """Run one DeepSeek call and return the first JSON array in the response.
+
+    Shared by the three selection stages (score, condense, novelty). Raises on
+    any error or a wrong-length/unusable response; callers fall back.
+    """
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": model,
+        "model": DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
         "max_tokens": SCORE_MAX_TOKENS,
     }
-    resp = requests.post(url, json=payload, headers=headers, timeout=240)
+    resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=240)
     resp.raise_for_status()
     data = resp.json()
     choice = data["choices"][0]
@@ -215,14 +259,11 @@ def _score_papers(papers, prompt, api_key, url, model):
             f"empty content from model "
             f"(finish_reason={choice.get('finish_reason')}, usage={data.get('usage')})"
         )
-    # Model may wrap the JSON in fences or prose; extract the first JSON array.
-    start = content.find("[")
-    end = content.rfind("]")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError(f"no JSON array in response: {content[:200]}")
-    arr = json.loads(content[start:end + 1])
-    if not isinstance(arr, list) or len(arr) != len(papers):
-        raise ValueError(f"expected {len(papers)} scores, got {len(arr) if isinstance(arr, list) else type(arr)}")
+    return _extract_json_array(content, expected_len)
+
+def _score_papers(papers, prompt):
+    """Score each paper; returns list of (relevance, significance) pairs."""
+    arr = _deepseek_json_array(prompt, len(papers))
     out = []
     for pair in arr:
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
@@ -234,18 +275,17 @@ def _score_papers(papers, prompt, api_key, url, model):
         out.append((rel, sig))
     return out
 
-def deepseek_select_title(term_name, papers):
-    """Score each paper on relevance and significance, pick the best product.
+def deepseek_score_papers(term_name, papers):
+    """Stage 1: score each paper on relevance & significance. Prompt unchanged.
 
-    Returns (selected_title_or_None, note_or_None). The model returns, per title
-    (same order), a [relevance, significance] pair each 0-10 (both 0 if not a
-    primary source). The winner is the highest relevance*significance product;
-    ties are broken randomly. On any failure we fall back to the first paper.
+    Scored in SCORE_BATCH-sized chunks so the model never has to emit one huge
+    array (which truncates at max_tokens and loses the [rel,sig] format).
     """
-    if not papers:
-        return None, None
-    titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(papers)])
-    prompt = f"""You are scoring papers for a researcher who reads primary sources.
+    scores = []
+    for i in range(0, len(papers), SCORE_BATCH):
+        batch = papers[i:i + SCORE_BATCH]
+        titles_text = "\n".join([f"{j+1}. {p['title']}" for j, p in enumerate(batch)])
+        prompt = f"""You are scoring papers for a researcher who reads primary sources.
 
 For each title below (topic: "{term_name}"), output exactly one JSON array of
 [relevance, significance] pairs, in the SAME order as the titles, nothing else.
@@ -257,27 +297,164 @@ Scoring rules (each score is an integer 0-10):
 Titles:
 {titles_text}
 
-Return only a JSON array like [[rel,sig],[rel,sig],...] with exactly {len(papers)} entries, one per title, in order. No prose, no code fences.
+Return only a JSON array like [[rel,sig],[rel,sig],...] with exactly {len(batch)} entries, one per title, in order. No prose, no code fences.
 """
+        scores.extend(_score_papers(batch, prompt))
+    return scores
+
+def deepseek_condense_titles(papers):
+    """Stage 2: condense each title into a short generic 'what they did' phrase.
+
+    Returns list of short plain-language descriptions (same order as papers),
+    phrased to work as PubMed keyword searches.
+    """
+    titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(papers)])
+    prompt = f"""For a researcher, rewrite each title below as a short plain-language description of what the paper DID — a generic explanation of the work, not the catchy title. Examples: "a model designed to predict large serine recombinase off-targets", "a lipid nanoparticle formulated to avoid hepatic accumulation". Phrase it so a PubMed keyword search would find papers doing the same kind of work.
+
+Titles:
+{titles_text}
+
+Output exactly one JSON array of {len(papers)} strings (one per title, same order), nothing else. No prose, no code fences.
+"""
+    arr = _deepseek_json_array(prompt, len(papers))
+    out = []
+    for s in arr:
+        if not isinstance(s, str) or not s.strip():
+            raise ValueError(f"malformed condensed title: {s!r}")
+        out.append(s.strip())
+    return out
+
+# How many similar titles to pull per stage-3 search, and the fetch buffer so
+# that excluding the original paper still leaves SIMILAR_TOP titles.
+SIMILAR_TOP = 5
+SIMILAR_FETCH = 8
+
+def search_similar_titles(query, exclude_pmids=None):
+    """Search all of PubMed for papers doing what `query` describes.
+
+    Returns up to SIMILAR_TOP titles most similar to the query, dropping any
+    PMID in exclude_pmids (the original paper itself is its own top match).
+    Sorted by relevance, all-time, so long-existing work is surfaced.
+    """
+    Entrez.email = ENTREZ_EMAIL
+    exclude_pmids = exclude_pmids or set()
+    try:
+        handle = Entrez.esearch(db="pubmed", term=query, retmax=SIMILAR_FETCH, sort="relevance")
+    except Exception:
+        # shortcut: some NCBI mirrors reject an explicit sort; fall back to default.
+        handle = Entrez.esearch(db="pubmed", term=query, retmax=SIMILAR_FETCH)
+    record = Entrez.read(handle)
+    handle.close()
+    time.sleep(0.3)
+    pmids = [p for p in record["IdList"] if p not in exclude_pmids][:SIMILAR_TOP]
+    if not pmids:
+        return []
+    return [p["title"] for p in fetch_metadata(pmids)]
+
+def deepseek_reevaluate_novelty(papers, similar_by_idx):
+    """Stage 4: score each top paper's novelty against similar papers in PubMed.
+
+    Returns list of int novelty scores 0-10 (same order as papers).
+    """
+    blocks = []
+    for i, p in enumerate(papers):
+        lines = [f"{i+1}. ORIGINAL: {p['title']}"]
+        sims = similar_by_idx.get(i, [])
+        if sims:
+            lines.append("   Similar papers already in PubMed:")
+            lines += [f"   - {t}" for t in sims]
+        else:
+            lines.append("   (no closely similar papers found)")
+        blocks.append("\n".join(lines))
+    body = "\n\n".join(blocks)
+    prompt = f"""You are judging whether each paper below is actually NOVEL compared with papers that already exist in PubMed. Consider ONLY novelty — ignore relevance and significance.
+
+For each ORIGINAL paper, weigh the "Similar papers already in PubMed" listed under it and score novelty 0-10:
+- 10 = the similar papers do NOT do the same thing (a new method, target, or result the existing literature lacks).
+- 5 = partial overlap: related but with a real difference.
+- 0 = the same work (or essentially the same result) already exists in PubMed.
+
+{body}
+
+Output exactly one JSON array of {len(papers)} integers (one novelty score per ORIGINAL paper, same order), nothing else. No prose, no code fences.
+"""
+    arr = _deepseek_json_array(prompt, len(papers))
+    return [min(10, max(0, int(float(v)))) for v in arr]
+
+def _pick_winner(n, products, novelty):
+    """Index in [0, n) of the most novel paper; ties by stage-1 product, then random."""
+    return min(range(n), key=lambda j: (-novelty[j], -products[j], random.random()))
+
+def select_paper(term_name, papers):
+    """Pick the single most relevant, significant, and NOVEL paper.
+
+    Stages: score all titles (same prompt as before) -> condense the top 5 into
+    generic 'what they did' phrases -> search PubMed for each phrase and collect
+    the 5 most similar existing titles -> score each top paper's novelty against
+    those (novelty only). Winner = the top-5 paper with the highest novelty score;
+    ties broken by the stage-1 relevance*significance product, then randomly.
+
+    Returns (selected_title_or_None, note_or_None). On any failure we fall back
+    to the stage-1 top-ranked paper so the digest still goes out.
+    """
+    if not papers:
+        return None, None
     if not DEEPSEEK_API_KEY:
         return papers[0]['title'], "DEEPSEEK_API_KEY not set; used first paper"
+    if len(papers) < 2:
+        # A single paper is the only choice; nothing to rank or compare against.
+        return papers[0]['title'], None
+
     try:
-        scores = _score_papers(papers, prompt, DEEPSEEK_API_KEY, DEEPSEEK_URL, DEEPSEEK_MODEL)
+        scores = deepseek_score_papers(term_name, papers)
+        ranking = sorted(range(len(papers)), key=lambda i: scores[i][0] * scores[i][1], reverse=True)
     except Exception as e:
         logger.error(f"DeepSeek scoring error: {e}")
         return papers[0]['title'], f"DeepSeek scoring error ({e}); used first paper"
 
-    products = [r * s for r, s in scores]
-    best = max(products)
-    # Random tie-break among all papers with the top product.
-    winners = [i for i, p in enumerate(products) if p == best]
-    idx = random.choice(winners)
+    top = ranking[:TOP_N]
+    products = [scores[i][0] * scores[i][1] for i in top]
+    fallback_title = papers[top[0]]['title']
+
+    # Stage 2 — condense the top titles into generic search phrases.
+    try:
+        phrases = deepseek_condense_titles([papers[i] for i in top])
+    except Exception as e:
+        logger.error(f"DeepSeek condense error: {e}")
+        return fallback_title, f"Novelty check skipped (condense error {e}); used stage-1 top paper"
+
+    # Stage 3 — PubMed similarity searches, keyed by position within `top`.
+    similar_by_idx = {}
+    searches_failed = False
+    for k, i in enumerate(top):
+        try:
+            sims = search_similar_titles(phrases[k], {papers[j].get("pmid") for j in top})
+        except Exception as e:
+            logger.warning(f"Similarity search failed for '#{k+1} {phrases[k]}': {e}")
+            searches_failed = True
+            sims = []
+        if sims:
+            similar_by_idx[k] = sims
+    if not similar_by_idx:
+        return fallback_title, "Novelty check skipped (no similarity search results); used stage-1 top paper"
+
+    # Stage 4 — novelty-only reevaluation.
+    try:
+        novelty = deepseek_reevaluate_novelty([papers[i] for i in top], similar_by_idx)
+    except Exception as e:
+        logger.error(f"DeepSeek novelty error: {e}")
+        return fallback_title, f"Novelty check skipped (novelty error {e}); used stage-1 top paper"
+
+    winner_k = _pick_winner(len(top), products, novelty)
+    idx = top[winner_k]
     logger.info(
-        f"DeepSeek scored {len(papers)} papers; winner #{idx+1} "
-        f"(rel={scores[idx][0]}, sig={scores[idx][1]}, product={best}, tied={len(winners)}): "
-        f"{papers[idx]['title']}"
+        f"DeepSeek scored {len(papers)} papers; top-{len(top)} novelty="
+        f"{[novelty[j] for j in range(len(top))]} for "
+        f"{[papers[top[j]]['title'][:40] for j in range(len(top))]}; "
+        f"winner #{idx+1} (novelty={novelty[winner_k]}): {papers[idx]['title']}"
     )
-    return papers[idx]['title'], None
+    note = "One or more PubMed similarity searches failed; novelty check is partial" if searches_failed else None
+    return papers[idx]['title'], note
 
 # =============================================================================
 # REDDIT (harshmaur/reddit-scraper)
@@ -393,7 +570,7 @@ def main():
 
         selected_paper = None
         if papers:
-            selected_title, sel_note = deepseek_select_title(term_name, papers)
+            selected_title, sel_note = select_paper(term_name, papers)
             if sel_note:
                 problems.append(f"Paper selection: {sel_note}")
             if selected_title:
