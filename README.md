@@ -61,14 +61,13 @@ Selection then runs in four stages:
 
 1. **Rank** — DeepSeek scores every title on relevance and significance (rules
    below); the top 5 by the relevance×significance product are kept.
-2. **Condense** — DeepSeek rewrites each of those 5 titles as a short generic
-   "what the paper did" phrase (e.g. *"a model designed to predict large serine
-   recombinase off-targets"*, *"a lipid nanoparticle formulated to avoid hepatic
-   accumulation"*).
-3. **Check the literature** — each phrase is searched against all of PubMed
-   (best-match, all-time); the 5 most similar existing titles are collected.
-   This is what reveals papers that are significant and relevant but **not
-   actually new**.
+2. **Keywords** — each top paper's search keywords come from its PubMed record
+   when available (author keywords, else cleaned MeSH headings). If the record
+   has neither, DeepSeek extracts the title’s keywords (one or more).
+3. **Check the literature** — PubMed is searched with `"Keyword 1" AND
+   "Keyword 2" AND "Keyword 3"` (best-match, all-time); the 5 most similar
+   existing titles are collected. This is what reveals papers that are
+   significant and relevant but **not actually new**.
 4. **Judge novelty** — each top paper is shown alongside its similar papers and
    DeepSeek scores only its *novelty* (0–10). The most novel of the 5 wins
    (ties by relevance×significance, then at random).
