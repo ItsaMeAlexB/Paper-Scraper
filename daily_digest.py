@@ -316,7 +316,7 @@ def _score_papers(papers, prompt):
     return out
 
 def deepseek_score_papers(term_name, papers):
-    """Stage 1: score each paper on relevance & significance. Prompt unchanged.
+    """Stage 1: score each paper on relevance & significance.
 
     Scored in SCORE_BATCH-sized chunks so the model never has to emit one huge
     array (which truncates at max_tokens and loses the [rel,sig] format).
@@ -331,8 +331,8 @@ For each title below (topic: "{term_name}"), output exactly one JSON array of
 [relevance, significance] pairs, in the SAME order as the titles, nothing else.
 
 Scoring rules (each score is an integer 0-10):
-- relevance: how directly the paper is about "{term_name}" itself (not just using it as a method or just mentioning it in passing), AND how directly it pertains to human. Non-human, non-human cell, and non-animal model work scores low here unless described as translational to humans (they may say "would also work in eukarya", which is relevant).
-- significance: how much the paper advances the field (new data, new method, new model, or a landmark benchmark/meta-analysis). If the paper is NOT a primary source (review, editorial, news, etc), it scores lowely on significance. Suspected paper mills (possibly identified by the publising journal's reputation), should also be scored lowely.
+- relevance: how directly the paper is about "{term_name}" itself (not just using it as a method or just mentioning it in passing). It also refers to how translatable it is to human gene therapy — if it's solely used in prokaryotes or solely used for vaccines with no clear adaptiveness, then it scores low. Note some things, like protein folding models or off-target analyses, have adaptiveness through, for example, improving Cas9 activity.
+- significance: how much the paper advances the field (new data, new method, new model, or a landmark benchmark/meta-analysis). If the paper is not a primary source (review, editorial, news, etc), it scores low on significance. Suspected paper mills (identified by you by suspicious authors, tortured phrases, journals with high retraction rates, etc.) should also be scored low.
 
 Titles:
 {titles_text}
@@ -343,21 +343,30 @@ Return only a JSON array like [[rel,sig],[rel,sig],...] with exactly {len(batch)
     return scores
 
 def deepseek_extract_keywords(papers):
-    """Stage 2: extract PubMed search keywords from titles that have none in
-    their PubMed record (see paper_keywords). This runs only for the top papers
-    whose record supplies neither keywords (OT) nor headings (MH).
+    """Stage 2: produce disease-free PubMed search keywords for each top paper.
 
-    Returns a list, in order, of keyword lists (one or more phrases).
+    Each paper's PubMed keywords (OT/MH) are used as the source terms when
+    present (else the title), and DeepSeek is asked to pull/clean technical
+    search keywords, replacing niche disease names with a generic term so the
+    boolean search stays broad. Runs for all candidates, so disease terms from
+    the record are de-niched too.
+
+    Returns a list (in order) of keyword lists (one or more phrases).
     """
-    titles_text = "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(papers)])
-    prompt = f"""For a researcher, extract search keywords from each title below for a PubMed keyword search.
+    seeds = []
+    for p in papers:
+        seeds.append(" ".join(paper_keywords(p) or []) or p.get("title", ""))
+    lines = "\n".join([f"{i+1}. {seed}" for i, seed in enumerate(seeds)])
+    prompt = f"""For a researcher, pull or clean the PubMed search keywords out of each line below. A line is the paper's technical terms if it has them, otherwise its title.
 
-Extract the keywords from each title — the specific technique, molecule, target, or question actually worked on, as a short indexable phrase (1-5 words) in exact scientific wording (e.g. "CRISPR-Cas9", "base editing", "hepatic accumulation"). A title may have just one keyword or several. Skip generic filler like "study", "analysis", "method", "model", "paper".
+Generate keywords from the title that the paper relates to. If a title is "Using CRISPR/Cas9 to treat a beta-thalassemia", keywords would be "CRISPR/Cas9" and "gene therapy", since "gene therapy" replaces "beta-thalassemia" as that is too niche a keyword. You should replace diseases with a generic term like that.
 
-Titles:
-{titles_text}
+For papers whose keywords could be fetched directly from PubMed, these simply need to be cleaned (de-niching specific diseases).
 
-Output exactly one JSON array of {len(papers)} arrays, one per title in order, each a JSON array of one or more keyword strings. No prose, no code fences.
+Lines:
+{lines}
+
+Output exactly one JSON array of {len(papers)} arrays, one per line in order, each a JSON array of one or more keyword strings. No prose, no code fences.
 """
     arr = _deepseek_json_array(prompt, len(papers), entries_are_lists=True)
     out = []
@@ -417,14 +426,11 @@ def deepseek_reevaluate_novelty(papers, similar_by_idx):
             lines.append("   (no closely similar papers found)")
         blocks.append("\n".join(lines))
     body = "\n\n".join(blocks)
-    prompt = f"""You are judging whether each paper below is actually NOVEL compared with papers that already exist in PubMed. Consider ONLY novelty — ignore relevance and significance.
+    prompt = f"""You are judging how genuinely NOVEL each paper is based on similar papers in literature.
 
-For each ORIGINAL paper, weigh the "Similar papers already in PubMed" listed under it and score novelty 0-10:
-- 10 = the similar papers do NOT do the same thing (a new method, target, or result the existing literature lacks).
-- 5 = partial overlap: related but with a real difference.
-- 0 = the same work (or essentially the same result) already exists in PubMed.
+For each ORIGINAL paper, weigh the "Similar papers already in PubMed" listed under it, and score its novelty 0-10 with 10 being a genuinely NEW technique, discovery, process, database, a groundbreaking clinical trial, etc. If a CRISPR/Cas9 has been used to treat a new disease, it is not seen as novel if the exact same method was used to treat a different disease.
 
-An ORIGINAL marked "(no closely similar papers found)" had no matches in PubMed for its keywords. That means the topic is either very esoteric or genuinely very novel — judge which from the title and score accordingly; do not auto-award high or low novelty just because no similar paper turned up.
+An ORIGINAL with low or no similar papers could indicate true novelty, or it could just be a case of an esoteric title which could not easily be linked to similar papers. This is your decision to make based on the title.
 
 {body}
 
@@ -469,25 +475,15 @@ def select_paper(term_name, papers):
     products = [scores[i][0] * scores[i][1] for i in top]
     fallback_title = papers[top[0]]['title']
 
-    # Stage 2 — keywords per top paper: from its PubMed record when present,
-    # else extracted from the title by DeepSeek (one call for the rest).
+    # Stage 2 — search keywords per top paper (record OT/MH as source, else
+    # title); DeepSeek scrubs disease/condition names so the boolean search stays broad.
     top_papers = [papers[i] for i in top]
-    kw_by_k = {}
-    need_extraction = []
-    for k, p in enumerate(top_papers):
-        kw = paper_keywords(p)
-        if kw:
-            kw_by_k[k] = kw
-        else:
-            need_extraction.append(k)
-    if need_extraction:
-        try:
-            extracted = deepseek_extract_keywords([top_papers[k] for k in need_extraction])
-        except Exception as e:
-            logger.error(f"DeepSeek keyword extraction error: {e}")
-            return fallback_title, f"Novelty check skipped (keyword extraction error {e}); used stage-1 top paper"
-        for k, kws in zip(need_extraction, extracted):
-            kw_by_k[k] = kws
+    try:
+        extracted = deepseek_extract_keywords(top_papers)
+    except Exception as e:
+        logger.error(f"DeepSeek keyword extraction error: {e}")
+        return fallback_title, f"Novelty check skipped (keyword extraction error {e}); used stage-1 top paper"
+    kw_by_k = {k: kws for k, kws in enumerate(extracted)}
 
     # Stage 3 — PubMed similarity searches, keyed by position within `top`.
     similar_by_idx = {}
