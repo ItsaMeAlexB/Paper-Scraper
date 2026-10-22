@@ -1,13 +1,9 @@
-# Secrets — never commit real credentials
+# Local-only: secrets and per-device state
 .env
-
-# Runtime state
+sources.txt
 last_sent_date.txt
-
-# Logs
 logs/
 
 # Python
 __pycache__/
 *.pyc
-.venv/
