@@ -2,8 +2,8 @@
 import os
 import sys
 import time
-import json
-import random
+import re
+import html
 import logging
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -25,6 +25,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 APIFY_API_KEY = os.environ.get("APIFY_API")
+
+REQUIRED_ENV = ["DEEPSEEK_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+                "ENTREZ_EMAIL", "APIFY_API"]
 
 LAST_SENT_FILE = os.path.join(BASE_DIR, "last_sent_date.txt")
 CONFIG_FILE = os.path.join(BASE_DIR, "sources.txt")
@@ -68,14 +71,28 @@ def setup_logging():
 logger = setup_logging()
 
 # =============================================================================
-# CONFIG LOADING
+# CONFIG VALIDATION & LOADING
 # =============================================================================
+
+def _check_env():
+    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
+    if missing:
+        logger.error(
+            f"Missing environment variables: {', '.join(missing)}. "
+            f"Copy .env.example to .env and fill it in."
+        )
+        sys.exit(1)
+
+_check_env()
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        logger.error(f"Config file {CONFIG_FILE} not found.")
+        logger.error(
+            f"Config file {CONFIG_FILE} not found. Copy sources.txt.example "
+            f"to sources.txt and fill in [TERMS], [SUBREDDITS], and [AUTHORS]."
+        )
         sys.exit(1)
-    with open(CONFIG_FILE, "r") as f:
+    with open(CONFIG_FILE) as f:
         lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
     terms, subreddits, authors = [], [], []
@@ -105,15 +122,6 @@ def load_config():
 TERMS, SUBREDDITS, AUTHORS = load_config()
 AUTHOR_QUERIES = [f'"{a}"[AU]' for a in AUTHORS]
 logger.info(f"Loaded {len(TERMS)} terms, {len(SUBREDDITS)} subreddits, {len(AUTHORS)} authors")
-
-# =============================================================================
-# ROTATION (deterministic by date)
-# =============================================================================
-# GitHub Actions runs on an ephemeral filesystem, so persistent index files
-# are lost between runs. Deriving the index from the day number rotates each
-# list in order for any length, every N days, with no stored state.
-def rotation_index(list_len):
-    return datetime.now(timezone.utc).toordinal() % list_len
 
 # =============================================================================
 # PUBMED
@@ -165,7 +173,8 @@ def fetch_metadata(pmids):
     papers = []
     for rec in records:
         authors = rec.get("AU", [])
-        if not authors:
+        pmid = rec.get("PMID", "").strip()
+        if not authors or not pmid:
             continue
         doi = None
         for id_ in rec.get("AID", []):
@@ -175,347 +184,170 @@ def fetch_metadata(pmids):
         papers.append({
             "doi": doi,
             "title": rec.get("TI", ""),
-            "abstract": rec.get("AB", ""),
             "authors": authors,
             "journal": rec.get("JT", ""),
             "date": rec.get("DP", ""),
-            "pmid": rec.get("PMID", ""),
-            "ot": rec.get("OT", []),
-            "mh": rec.get("MH", []),
+            "pmid": pmid,
         })
     return papers
 
-# Common non-topical MeSH headings that would swamp a keyword AND-query.
-BOILERPLATE_MESH = {"humans", "animals", "male", "female", "mice", "rats",
-                    "child", "adult", "aged", "adolescent", "infant"}
-KEYWORD_MAX = 4  # cap per query: ANDing many phrases turns up zero results
-
-def paper_keywords(paper):
-    """Keywords already in the PubMed record: author keywords (OT) if present,
-    else cleaned MeSH headings (MH), subheadings and boilerplate stripped.
-
-    Returns None when the record has neither, in which case keywords must be
-    extracted from the title by DeepSeek.
-    """
-    def clean(terms):
-        out = []
-        for t in terms:
-            t = t.split("/", 1)[0].strip().strip('*').strip().strip('"')
-            if t and t.lower() not in BOILERPLATE_MESH and t not in out:
-                out.append(t)
-        return out
-
-    kw = clean(paper.get("ot") or []) or clean(paper.get("mh") or [])
-    return kw[:KEYWORD_MAX] or None
-
 # =============================================================================
-# TITLE SELECTION (DeepSeek scoring)
+# SCOPING REVIEW (single DeepSeek call)
 # =============================================================================
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-# Non-reasoning model: no chain-of-thought tokens competing with the answer,
-# so structured JSON output is reliable for large batched scoring.
-DEEPSEEK_MODEL = "deepseek-chat"
-# [rel, sig] pairs are ~5-7 tokens each; this budget comfortably covers very
-# large batches (hundreds of papers) with headroom.
-SCORE_MAX_TOKENS = 16000
-TOP_N = 5  # how many top titles survive stage-1 ranking for the novelty check
-# Stage-1 scores one paper batch per call. Small on purpose: beyond a few dozen
-# papers deepseek-chat miscounts entries (drops pairs, breaking positional
-# alignment) and abandons the [[rel,sig],...] format.
-SCORE_BATCH = 25
+# Reasoning model: the scoping-review task is judgement + prose, not structured
+# JSON, so chain-of-thought is an asset rather than a distraction. max_tokens
+# is not set: the reasoner picks its own output budget.
+DEEPSEEK_MODEL = "deepseek-reasoner"
 
-def _extract_json_array(content, expected_len, entries_are_lists=False):
-    """Pull expected_len JSON entries out of model text. Pure.
+# Model emits [[REF:n]]; we render the anchor. Tokens are tiny, so this saves
+# context and makes malformed HTML impossible by construction.
+REF_RE = re.compile(r"\[\[REF:(\d+)\]\]")
+TAG_RE = re.compile(r"<[^>]+>")
+UNIT_RE = re.compile(r'<a [^>]*>[^<]*</a>|\s+|[^\s<]+', re.S)
 
-    1) Preferred: a single wrapping array of expected_len entries.
-    2) Fallback: consecutive standalone JSON values (e.g. newline-separated
-       [rel,sig] pairs) that deepseek-chat sometimes emits instead of one array.
+def _paper_key(p):
+    return p.get("pmid") or p.get("doi") or p.get("title", "").strip().lower()
 
-    entries_are_lists: entries are themselves arrays (e.g. keyword lists), so
-    don't unwrap single-element ones.
-    """
-    start = content.find("[")
-    if start != -1:
-        end = content.rfind("]")
-        if end > start:
-            try:
-                arr = json.loads(content[start:end + 1])
-                if isinstance(arr, list) and len(arr) == expected_len:
-                    return arr
-            except ValueError:
-                pass
-    # Fallback: parse each standalone JSON value in order (unwrap 1-element
-    # sub-arrays like ["txt"] -> "txt").
-    dec = json.JSONDecoder()
-    out = []
-    i = content.find("[")
-    while i != -1 and len(out) < expected_len:
-        try:
-            val, idx = dec.raw_decode(content[i:])
-        except ValueError:
-            break
-        if not entries_are_lists and isinstance(val, list) and len(val) == 1:
-            val = val[0]
-        out.append(val)
-        i = content.find("[", i + idx)
-    if len(out) == expected_len:
-        return out
-    if len(out) == 1 and isinstance(out[0], list):
-        raise ValueError(f"expected {expected_len} entries, got one array of {len(out[0])} (miscount by model)")
-    raise ValueError(f"expected {expected_len} entries, got {len(out)} (content[:200]={content[:200]!r})")
+def _paper_link(p):
+    if p.get("doi"):
+        return f"https://doi.org/{p['doi']}"
+    return f"https://pubmed.ncbi.nlm.nih.gov/{p['pmid']}/"
 
-def _deepseek_json_array(prompt, expected_len, entries_are_lists=False):
-    """Run one DeepSeek call and return the first JSON array in the response.
+def _last_author(p):
+    return p["authors"][-1] if p.get("authors") else "Unknown"
 
-    Shared by the three selection stages (score, condense, novelty). Raises on
-    any error or a wrong-length/unusable response; callers fall back.
-    """
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+def _deepseek_text(prompt):
+    """Run one DeepSeek call and return the response text. Retries once on an
+    empty response; HTTP errors propagate."""
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+               "Content-Type": "application/json"}
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "max_tokens": SCORE_MAX_TOKENS,
     }
     last_err = None
     for attempt in (0, 1):
-        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=240)
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=600)
         resp.raise_for_status()
         data = resp.json()
         choice = data["choices"][0]
-        msg = choice["message"]
-        content = (msg.get("content") or "").strip()
-        if not content:
-            raise ValueError(
-                f"empty content from model "
-                f"(finish_reason={choice.get('finish_reason')}, usage={data.get('usage')})"
-            )
-        try:
-            return _extract_json_array(content, expected_len, entries_are_lists)
-        except ValueError as e:
-            # Sometimes miscounts or breaks format mid-array; one regeneration
-            # at temperature 0 is cheap and fixes it. HTTP errors don't retry.
-            last_err = e
-            logger.warning(f"DeepSeek response parse failed (attempt {attempt+1}/2): {e}")
-            time.sleep(1)
+        content = (choice["message"].get("content") or "").strip()
+        if content:
+            return content
+        last_err = ValueError(
+            f"empty content (finish_reason={choice.get('finish_reason')}, "
+            f"usage={data.get('usage')})"
+        )
+        logger.warning(f"DeepSeek empty response (attempt {attempt+1}/2)")
+        time.sleep(1)
     raise last_err
 
-def _score_papers(papers, prompt):
-    """Score each paper; returns list of (relevance, significance) pairs."""
-    arr = _deepseek_json_array(prompt, len(papers))
-    out = []
-    for pair in arr:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            raise ValueError(f"malformed pair: {pair!r}")
-        rel, sig = pair
-        # Clamp and coerce to int 0-10.
-        rel = min(10, max(0, int(float(rel))))
-        sig = min(10, max(0, int(float(sig))))
-        out.append((rel, sig))
-    return out
+def _render_citations(text, links):
+    """Escape prose, then replace [[REF:n]] with a clickable anchor labelled [n].
+    Unknown refs (model hallucination) are left as plain text and logged."""
+    safe = html.escape(text, quote=False)   # & < > only
 
-def deepseek_score_papers(term_name, papers):
-    """Stage 1: score each paper on relevance & significance.
+    def sub(m):
+        n = int(m.group(1))
+        url = links.get(n)
+        if not url:
+            logger.warning(f"unknown reference [[REF:{n}]] in scoping review")
+            return f"[{n}]"
+        return f'<a href="{html.escape(url, quote=True)}">[{n}]</a>'
 
-    Scored in SCORE_BATCH-sized chunks so the model never has to emit one huge
-    array (which truncates at max_tokens and loses the [rel,sig] format).
-    """
-    scores = []
-    for i in range(0, len(papers), SCORE_BATCH):
-        batch = papers[i:i + SCORE_BATCH]
-        titles_text = "\n".join([f"{j+1}. {p['title']}" for j, p in enumerate(batch)])
-        prompt = f"""You are scoring papers for a researcher who reads primary sources.
+    return REF_RE.sub(sub, safe)
 
-For each title below (topic: "{term_name}"), output exactly one JSON array of
-[relevance, significance] pairs, in the SAME order as the titles, nothing else.
+def _visible(s):
+    return html.unescape(TAG_RE.sub("", s))
 
-Scoring rules (each score is an integer 0-10):
-- relevance: how directly the paper is about "{term_name}" itself (not just using it as a method or just mentioning it in passing). It also refers to how translatable it is to human gene therapy — if it's solely used in prokaryotes or solely used for vaccines with no clear adaptiveness, then it scores low. Note some things, like protein folding models or off-target analyses, have adaptiveness through, for example, improving Cas9 activity.
-- significance: how much the paper advances the field (new data, new method, new model, or a landmark benchmark/meta-analysis). If the paper is not a primary source (review, editorial, news, etc), it scores low on significance. Suspected paper mills (identified by you by suspicious authors, tortured phrases, journals with high retraction rates, etc.) should also be scored low.
+def _utf16_len(s):
+    return len(s.encode("utf-16-le")) // 2   # Telegram counts UTF-16 units
 
-Titles:
-{titles_text}
+def _chunk_html(text, limit=3800):
+    """Split HTML into chunks whose visible UTF-16 length is <= limit. Anchors
+    are atomic units, so a chunk can never end inside a tag."""
+    chunks, cur, cur_len = [], [], 0
+    for unit in UNIT_RE.findall(text):
+        n = _utf16_len(_visible(unit))
+        if cur and cur_len + n > limit:
+            chunks.append("".join(cur).strip())
+            cur, cur_len = [], 0
+            if not unit.strip():        # skip leading whitespace after split
+                continue
+        cur.append(unit)
+        cur_len += n
+    if cur:
+        chunks.append("".join(cur).strip())
+    return chunks
 
-Return only a JSON array like [[rel,sig],[rel,sig],...] with exactly {len(batch)} entries, one per title, in order. No prose, no code fences.
-"""
-        scores.extend(_score_papers(batch, prompt))
-    return scores
+def deepseek_scoping_review(term_name, papers, named_papers):
+    """Write a single scoping-review paragraph over all papers. Returns
+    (paragraph, {ref_number: url}) or (None, {})."""
+    if not papers and not named_papers:
+        return None, {}
 
-def deepseek_extract_keywords(papers):
-    """Stage 2: produce disease-free PubMed search keywords for each top paper.
+    entries, links = [], {}
 
-    Each paper's PubMed keywords (OT/MH) are used as the source terms when
-    present (else the title), and DeepSeek is asked to pull/clean technical
-    search keywords, replacing niche disease names with a generic term so the
-    boolean search stays broad. Runs for all candidates, so disease terms from
-    the record are de-niched too.
+    def add(p):
+        n = len(entries) + 1
+        links[n] = _paper_link(p)
+        entries.append(
+            f"[{n}] {p['title']} — {_last_author(p)} — {p.get('journal', 'Unknown')}"
+        )
 
-    Returns a list (in order) of keyword lists (one or more phrases).
-    """
-    seeds = []
+    topic_start = len(entries) + 1
     for p in papers:
-        seeds.append(" ".join(paper_keywords(p) or []) or p.get("title", ""))
-    lines = "\n".join([f"{i+1}. {seed}" for i, seed in enumerate(seeds)])
-    prompt = f"""For a researcher, pull or clean the PubMed search keywords out of each line below. A line is the paper's technical terms if it has them, otherwise its title.
+        add(p)
+    topic_end = len(entries)
 
-Generate keywords from the title that the paper relates to. If a title is "Using CRISPR/Cas9 to treat a beta-thalassemia", keywords would be "CRISPR/Cas9" and "gene therapy", since "gene therapy" replaces "beta-thalassemia" as that is too niche a keyword. You should replace diseases with a generic term like that.
+    named_start = len(entries) + 1
+    for p in named_papers:
+        add(p)
+    named_end = len(entries)
 
-For papers whose keywords could be fetched directly from PubMed, these simply need to be cleaned (de-niching specific diseases).
+    def section(header, lo, hi):
+        if lo > hi:
+            return f"{header}\n(none)"
+        return header + "\n" + "\n".join(entries[lo - 1:hi])
 
-Lines:
-{lines}
+    body = "\n\n".join([
+        section(f"TOPIC-SEARCH PAPERS ({topic_start}–{topic_end})", topic_start, topic_end),
+        section(f"NAMED-AUTHOR PAPERS ({named_start}–{named_end})", named_start, named_end),
+    ])
 
-Output exactly one JSON array of {len(papers)} arrays, one per line in order, each a JSON array of one or more keyword strings. No prose, no code fences.
-"""
-    arr = _deepseek_json_array(prompt, len(papers), entries_are_lists=True)
-    out = []
-    for entry in arr:
-        if isinstance(entry, str):
-            entry = [entry]
-        kws = []
-        if isinstance(entry, (list, tuple)):
-            kws = [str(t).strip().strip('"') for t in entry if str(t).strip()]
-        if not kws:
-            raise ValueError(f"malformed keyword entry: {entry!r}")
-        out.append(kws)
-    return out
+    prompt = f"""You are writing a scoping review of recent gene therapy literature for a researcher who already knows the search term "{term_name}" well. The papers below are in two sections: a PubMed topic search, and papers by named authors. Summarise them in one naturally flowing paragraph.
 
-# How many similar titles to pull per stage-3 search, and the fetch buffer so
-# that excluding the original paper still leaves SIMILAR_TOP titles.
-SIMILAR_TOP = 5
-SIMILAR_FETCH = 8
+Rules for the TOPIC-SEARCH section only — keep primary research articles relevant to gene therapy:
+- Relevant means a novel or field-advancing contribution — e.g. a new Cas variant, a new vector, or a finding such as RNA-seq being unchanged by vector dosing.
+- A prokaryotic mechanism is relevant only if the paper states it is transferable to mammalian cells; a protein-folding model is relevant if Cas could be engineered from it.
+- Viral-vector work can be relevant, but vaccine work is not.
+- CRISPR used merely as a method for an unrelated question is not relevant.
+- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: using CRISPR/Cas9 on a new disease is not novel per se, since many diseases have been treated in vitro; it is novel only if it is a clinical trial, a new mechanism, disease-agnostic, or similarly field-advancing.
+- Exclude suspected paper mills (suspicious authors, tortured phrases, low-reputation journals, etc.).
 
-def search_similar_titles(keywords, exclude_pmids=None):
-    """Search all of PubMed via "Keyword 1" AND "Keyword 2" AND "Keyword 3".
+Rules for the NAMED-AUTHOR section — these papers are MANDATORY. Every one of them must be weaved into the paragraph. They are exempt from the relevance, novelty, and paper-mill filtering above; the reader follows these labs regardless.
 
-    Returns up to SIMILAR_TOP titles, dropping any PMID in exclude_pmids (the
-    original paper itself is its own top match). Sorted by relevance, all-time,
-    so long-existing work is surfaced. An empty result is meaningful (esoteric or
-    genuinely novel) and is passed to the novelty stage as-is.
-    """
-    if not keywords:
-        return []
-    Entrez.email = ENTREZ_EMAIL
-    exclude_pmids = exclude_pmids or set()
-    query = " AND ".join(f'"{kw}"' for kw in keywords)
-    try:
-        handle = Entrez.esearch(db="pubmed", term=query, retmax=SIMILAR_FETCH, sort="relevance")
-    except Exception:
-        # shortcut: some NCBI mirrors reject an explicit sort; fall back to default.
-        handle = Entrez.esearch(db="pubmed", term=query, retmax=SIMILAR_FETCH)
-    record = Entrez.read(handle)
-    handle.close()
-    time.sleep(0.3)
-    pid = [p for p in record["IdList"] if p not in exclude_pmids][:SIMILAR_TOP]
-    return [p["title"] for p in fetch_metadata(pid)] if pid else []
+Length:
+- Write at least 10 sentences and at most 20.
+- Do not default to the upper end. Choose the length the material actually needs.
+- If there are fewer than 100 papers, or few significant papers, or the material is easy to summarise briefly, stay at 10 sentences.
+- Only if there are 200 or more papers, or the work requires a lot of explaining, or there are many genuinely good papers, may you use up to 20.
 
-def deepseek_reevaluate_novelty(papers, similar_by_idx):
-    """Stage 4: score each top paper's novelty against similar papers in PubMed.
+Style:
+- Refer to each paper by its lab (last author), e.g. "the Liu lab".
+- Cite ACS-style: immediately after the claim it supports and BEFORE the closing punctuation, write that paper's number in double square brackets, e.g. "…engineered a new non-viral vector [[REF:4]]."
+- Use the numbers exactly as shown in the paper lists. Never write a URL, a DOI, a PMID, or any HTML.
+- Assume the reader is comfortable with "{term_name}" itself, so keep technical terms rather than simplifying them away; but briefly explain any niche abbreviation, complex term, concept, or jargon in-line the first time it appears.
 
-    Returns list of int novelty scores 0-10 (same order as papers).
-    """
-    blocks = []
-    for i, p in enumerate(papers):
-        lines = [f"{i+1}. ORIGINAL: {p['title']}"]
-        sims = similar_by_idx.get(i, [])
-        if sims:
-            lines.append("   Similar papers already in PubMed:")
-            lines += [f"   - {t}" for t in sims]
-        else:
-            lines.append("   (no closely similar papers found)")
-        blocks.append("\n".join(lines))
-    body = "\n\n".join(blocks)
-    prompt = f"""You are judging how genuinely NOVEL each paper is based on similar papers in literature.
-
-For each ORIGINAL paper, weigh the "Similar papers already in PubMed" listed under it, and score its novelty 0-10 with 10 being a genuinely NEW technique, discovery, process, database, a groundbreaking clinical trial, etc. If a CRISPR/Cas9 has been used to treat a new disease, it is not seen as novel if the exact same method was used to treat a different disease.
-
-An ORIGINAL with low or no similar papers could indicate true novelty, or it could just be a case of an esoteric title which could not easily be linked to similar papers. This is your decision to make based on the title.
+Papers:
 
 {body}
 
-Output exactly one JSON array of {len(papers)} integers (one novelty score per ORIGINAL paper, same order), nothing else. No prose, no code fences.
+Write only the paragraph. No headings, no bullet points, no preamble.
 """
-    arr = _deepseek_json_array(prompt, len(papers))
-    return [min(10, max(0, int(float(v)))) for v in arr]
-
-def _pick_winner(n, products, novelty):
-    """Index in [0, n) of the most novel paper; ties by stage-1 product, then random."""
-    return min(range(n), key=lambda j: (-novelty[j], -products[j], random.random()))
-
-def select_paper(term_name, papers):
-    """Pick the single most relevant, significant, and NOVEL paper.
-
-    Stages: score all titles (same prompt as before) -> take each top-5 paper's
-    keywords (from its PubMed record if present, else extracted from its title
-    by DeepSeek) -> search PubMed for "Keyword 1" AND "Keyword 2" and collect
-    the 5 most similar existing titles -> score each top paper's novelty against
-    those (novelty only). Winner = the top-5 paper with the highest novelty score;
-    ties broken by the stage-1 relevance*significance product, then randomly.
-
-    Returns (selected_title_or_None, note_or_None). On any failure we fall back
-    to the stage-1 top-ranked paper so the digest still goes out.
-    """
-    if not papers:
-        return None, None
-    if not DEEPSEEK_API_KEY:
-        return papers[0]['title'], "DEEPSEEK_API_KEY not set; used first paper"
-    if len(papers) < 2:
-        # A single paper is the only choice; nothing to rank or compare against.
-        return papers[0]['title'], None
-
-    try:
-        scores = deepseek_score_papers(term_name, papers)
-        ranking = sorted(range(len(papers)), key=lambda i: scores[i][0] * scores[i][1], reverse=True)
-    except Exception as e:
-        logger.error(f"DeepSeek scoring error: {e}")
-        return papers[0]['title'], f"DeepSeek scoring error ({e}); used first paper"
-
-    top = ranking[:TOP_N]
-    products = [scores[i][0] * scores[i][1] for i in top]
-    fallback_title = papers[top[0]]['title']
-
-    # Stage 2 — search keywords per top paper (record OT/MH as source, else
-    # title); DeepSeek scrubs disease/condition names so the boolean search stays broad.
-    top_papers = [papers[i] for i in top]
-    try:
-        extracted = deepseek_extract_keywords(top_papers)
-    except Exception as e:
-        logger.error(f"DeepSeek keyword extraction error: {e}")
-        return fallback_title, f"Novelty check skipped (keyword extraction error {e}); used stage-1 top paper"
-    kw_by_k = {k: kws for k, kws in enumerate(extracted)}
-
-    # Stage 3 — PubMed similarity searches, keyed by position within `top`.
-    similar_by_idx = {}
-    searches_failed = False
-    exclude = {p.get("pmid") for p in top_papers}
-    for k in range(len(top_papers)):
-        try:
-            sims = search_similar_titles(kw_by_k.get(k), exclude)
-        except Exception as e:
-            logger.warning(f"Similarity search failed for #{k+1} {kw_by_k.get(k)}: {e}")
-            searches_failed = True
-            sims = []
-        if sims:
-            similar_by_idx[k] = sims
-
-    # Stage 4 — novelty-only reevaluation.
-    try:
-        novelty = deepseek_reevaluate_novelty([papers[i] for i in top], similar_by_idx)
-    except Exception as e:
-        logger.error(f"DeepSeek novelty error: {e}")
-        return fallback_title, f"Novelty check skipped (novelty error {e}); used stage-1 top paper"
-
-    winner_k = _pick_winner(len(top), products, novelty)
-    idx = top[winner_k]
-    logger.info(
-        f"DeepSeek scored {len(papers)} papers; top-{len(top)} novelty="
-        f"{[novelty[j] for j in range(len(top))]} for "
-        f"{[papers[top[j]]['title'][:40] for j in range(len(top))]}; "
-        f"winner #{idx+1} (novelty={novelty[winner_k]}): {papers[idx]['title']}"
-    )
-    note = "One or more PubMed similarity searches failed; novelty check is partial" if searches_failed else None
-    return papers[idx]['title'], note
+    return _deepseek_text(prompt), links
 
 # =============================================================================
 # REDDIT (harshmaur/reddit-scraper)
@@ -558,14 +390,17 @@ def fetch_top_post(subreddit, days_back=7):
 # TELEGRAM
 # =============================================================================
 
-def send_telegram(message):
+def send_telegram(message, parse_mode=None):
     if not message or not message.strip():
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+        payload["disable_web_page_preview"] = True
     try:
         requests.post(url, json=payload, timeout=30).raise_for_status()
-        logger.info(f"Telegram sent: {message[:60]}")
+        logger.info(f"Telegram sent: {_visible(message)[:60]}")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
         raise
@@ -574,134 +409,143 @@ def send_telegram(message):
 # DAILY STATE
 # =============================================================================
 
-def has_sent_today():
+def days_since_last_sent():
+    """None = never sent. 0 = sent today (skip). N>=1 = N-1 days missed."""
     if not os.path.exists(LAST_SENT_FILE):
-        return False
+        return None
     try:
-        with open(LAST_SENT_FILE, "r") as f:
-            last = f.read().strip()
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        return last == today
+        with open(LAST_SENT_FILE) as f:
+            last = datetime.strptime(f.read().strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return max(0, (datetime.now(timezone.utc).date() - last.date()).days)
     except Exception:
-        return False
+        return None
 
 def mark_sent_today():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with open(LAST_SENT_FILE, "w") as f:
-        f.write(today)
+        f.write(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
+# =============================================================================
+# ONE DIGEST RUN
+# =============================================================================
+
+def run_digest(run_date, now):
+    """One digest run. run_date picks the rotation; windows reach back to
+    run_date - rotation_length, ending at run_date (for catch-up) or at now
+    (for today). Returns a list of problems."""
+    days_late = (now.date() - run_date.date()).days
+    is_today = (days_late == 0)
+    end_date = now if is_today else run_date
+    problems = []
+
+    term_idx = run_date.toordinal() % len(TERMS)
+    sub_idx = run_date.toordinal() % len(SUBREDDITS)
+    term_name = TERMS[term_idx]
+    term_query = build_query(term_name)
+    subreddit = SUBREDDITS[sub_idx]
+    logger.info(f"[{run_date.date()}] term[{term_idx}]='{term_name}', "
+                f"sub[{sub_idx}]='{subreddit}', days_late={days_late}")
+
+    if not is_today:
+        send_telegram(f"📅 Catch-up digest for {run_date.strftime('%Y-%m-%d')}")
+
+    # Reddit: catch-up steps up from week to month tier.
+    M = len(SUBREDDITS)
+    days_back = M if is_today else 8
+    valid_post, apify_err = fetch_top_post(subreddit, days_back=days_back)
+    if apify_err:
+        problems.append(apify_err)
+    if valid_post:
+        logger.info(f"[{run_date.date()}] Reddit: '{valid_post.get('title')}' "
+                    f"({valid_post.get('upVotes')} upvotes)")
+    else:
+        problems.append(f"Reddit: no post found for r/{subreddit}")
+
+    # PubMed: term search ends at end_date so today's papers aren't doubled.
+    N = len(TERMS)
+    term_start = run_date - timedelta(days=N)
+    pmids = fetch_all_pmids(term_query, term_start, end_date)
+    papers = fetch_metadata(pmids) if pmids else []
+    logger.info(f"[{run_date.date()}] {len(papers)} papers for '{term_name}'")
+    if not papers:
+        problems.append(f"PubMed: zero papers for term '{term_name}'")
+
+    # Named authors (last day of the run's window).
+    auth_start = run_date - timedelta(days=1)
+    named_papers = []
+    for auth_q in AUTHOR_QUERIES:
+        auth_pmids = fetch_all_pmids(auth_q, auth_start, end_date)
+        if auth_pmids:
+            named_papers.extend(fetch_metadata(auth_pmids))
+    seen = {_paper_key(p) for p in papers}
+    named_papers = [p for p in named_papers if _paper_key(p) not in seen]
+    logger.info(f"[{run_date.date()}] {len(named_papers)} named-author papers")
+
+    # Scoping review.
+    summary, links = None, {}
+    if papers or named_papers:
+        try:
+            summary, links = deepseek_scoping_review(term_name, papers, named_papers)
+        except Exception as e:
+            logger.error(f"DeepSeek scoping-review error: {e}")
+            problems.append(f"Scoping review error: {e}")
+
+    if summary:
+        for chunk in _chunk_html(_render_citations(summary, links)):
+            send_telegram(chunk, parse_mode="HTML")
+    else:
+        problems.append("Scoping review: no summary produced")
+
+    # Reddit message.
+    if valid_post:
+        title = valid_post.get("title", "No title")
+        upvotes = valid_post.get("upVotes") or valid_post.get("score") or 0
+        author = valid_post.get("authorName", "unknown")
+        post_url = valid_post.get("postUrl") or valid_post.get("url")
+        send_telegram(f"{title}, r/{subreddit}, {upvotes} upvotes, u/{author}")
+        if post_url:
+            send_telegram(post_url)
+
+    return problems
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
-    problems = []
     try:
         now = datetime.now(timezone.utc)
         logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if has_sent_today():
+        days_since = days_since_last_sent()
+        if days_since == 0:
             logger.info("Already sent today, skipping")
             return
 
-        # Rotation
-        term_idx = rotation_index(len(TERMS))
-        sub_idx = rotation_index(len(SUBREDDITS))
-        term_name = TERMS[term_idx]
-        term_query = build_query(term_name)
-        subreddit = SUBREDDITS[sub_idx]
-        logger.info(f"Term[{term_idx}]='{term_name}', Subreddit[{sub_idx}]='{subreddit}'")
-
-        # --- 1. Reddit top post ---
-        M = len(SUBREDDITS)
-        valid_post, apify_err = fetch_top_post(subreddit, days_back=M)
-        if apify_err:
-            problems.append(apify_err)
-        if valid_post:
-            logger.info(f"Reddit: '{valid_post.get('title')}' ({valid_post.get('upVotes')} upvotes)")
+        if days_since is None or days_since == 1:
+            run_dates = [now]                                     # normal / first run
+        elif days_since == 2:
+            run_dates = [now - timedelta(days=1), now]            # one catch-up
         else:
-            problems.append(f"Reddit: no post found for r/{subreddit}")
+            logger.info(f"{days_since - 1} day(s) missed — replaying today only; "
+                        f"backlog ignored")
+            run_dates = [now]
 
-        # --- 2. PubMed for term (last N days) ---
-        N = len(TERMS)
-        start_date = now - timedelta(days=N)
-        pmids = fetch_all_pmids(term_query, start_date, now)
-        papers = fetch_metadata(pmids) if pmids else []
-        logger.info(f"Found {len(papers)} papers for '{term_name}'")
+        logger.info(f"Runs: {[d.strftime('%Y-%m-%d') for d in run_dates]}")
 
-        selected_paper = None
-        if papers:
-            selected_title, sel_note = select_paper(term_name, papers)
-            if sel_note:
-                problems.append(f"Paper selection: {sel_note}")
-            if selected_title:
-                for p in papers:
-                    if p["title"].strip().lower() == selected_title.lower():
-                        selected_paper = p
-                        break
-                if not selected_paper:
-                    selected_paper = papers[0]
-            else:
-                selected_paper = papers[0]
-        else:
-            problems.append(f"PubMed: zero papers for term '{term_name}'")
+        all_problems = []
+        for run_date in run_dates:
+            try:
+                all_problems.extend(run_digest(run_date, now))
+            except Exception as e:
+                logger.error(f"Run {run_date.date()} crashed: {e}")
+                logger.error(traceback.format_exc())
+                all_problems.append(f"Run {run_date.date()}: {e}")
 
-        # --- 3. Named authors (last 1 day) ---
-        named_papers = []
-        for auth_q in AUTHOR_QUERIES:
-            auth_pmids = fetch_all_pmids(auth_q, now - timedelta(days=1), now)
-            if auth_pmids:
-                named_papers.extend(fetch_metadata(auth_pmids))
-        if selected_paper:
-            sel_doi = selected_paper.get("doi")
-            sel_pmid = selected_paper.get("pmid")
-            named_papers = [p for p in named_papers if p.get("doi") != sel_doi and p.get("pmid") != sel_pmid]
-        logger.info(f"Named-author papers: {len(named_papers)}")
+        if all_problems:
+            send_telegram("⚠️ Digest issues:\n- " + "\n- ".join(all_problems))
 
-        # --- 4. Send Telegram messages ---
-        # Selected paper info
-        if selected_paper:
-            last_author = selected_paper['authors'][-1] if selected_paper.get('authors') else "Unknown"
-            journal = selected_paper.get('journal', "Unknown")
-            send_telegram(f"{selected_paper['title']}, in {journal}, under {term_name}, by {last_author} lab.")
-            if selected_paper.get("doi"):
-                link = f"https://doi.org/{selected_paper['doi']}"
-            elif selected_paper.get("pmid"):
-                link = f"https://pubmed.ncbi.nlm.nih.gov/{selected_paper['pmid']}/"
-            else:
-                link = "No link available"
-            send_telegram(link)
-
-        # Named author papers
-        for p in named_papers:
-            last_author = p['authors'][-1] if p.get('authors') else "Unknown"
-            journal = p.get('journal', "Unknown")
-            send_telegram(f"{p['title']}, in {journal}, under named author, by {last_author} lab.")
-            if p.get("doi"):
-                link = f"https://doi.org/{p['doi']}"
-            elif p.get("pmid"):
-                link = f"https://pubmed.ncbi.nlm.nih.gov/{p['pmid']}/"
-            else:
-                link = "No link available"
-            send_telegram(link)
-
-        # Reddit post
-        if valid_post:
-            title = valid_post.get("title", "No title")
-            upvotes = valid_post.get("upVotes") or valid_post.get("score") or 0
-            author = valid_post.get("authorName", "unknown")
-            post_url = valid_post.get("postUrl") or valid_post.get("url")
-            send_telegram(f"{title}, r/{subreddit}, {upvotes} upvotes, u/{author}")
-            if post_url:
-                send_telegram(post_url)
-
-        # --- 5. Report any issues as a separate message ---
-        if problems:
-            send_telegram("⚠️ Digest issues:\n- " + "\n- ".join(problems))
-
-        # Mark sent
         mark_sent_today()
-        logger.info("Digest sent successfully.")
+        logger.info("All digests sent.")
 
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
