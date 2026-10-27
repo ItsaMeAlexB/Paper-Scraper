@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 cd "$(dirname "$0")" || exit 1
 mkdir -p logs
 [ -f .env ]        || { cp .env.example .env;              echo "Created .env — edit it."; }

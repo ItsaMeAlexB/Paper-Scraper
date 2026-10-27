@@ -9,7 +9,6 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import requests
-from Bio import Entrez, Medline
 from apify_client import ApifyClient
 from dotenv import load_dotenv
 
@@ -134,25 +133,29 @@ def build_query(term):
         return term
     return f'"{term}"'
 
+# NCBI E-utilities over plain HTTP — drops the biopython (and its numpy) dependency.
+ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
-    Entrez.email = ENTREZ_EMAIL
     start_str = start_date.strftime("%Y/%m/%d")
     end_str = end_date.strftime("%Y/%m/%d")
     pmids = []
     retstart = 0
-    retmax = 1000
     while True:
-        handle = Entrez.esearch(db="pubmed", term=query,
-                                mindate=start_str, maxdate=end_str,
-                                retstart=retstart, retmax=retmax, sort="pub date")
-        record = Entrez.read(handle)
-        handle.close()
-        batch = record["IdList"]
+        params = {
+            "db": "pubmed", "term": query,
+            "mindate": start_str, "maxdate": end_str,
+            "retstart": retstart, "retmax": 1000, "sort": "pub date",
+            "retmode": "json", "email": ENTREZ_EMAIL,
+        }
+        record = requests.get(ESEARCH_URL, params=params, timeout=60).json()["esearchresult"]
+        batch = record.get("idlist", [])
         if not batch:
             break
         pmids.extend(batch)
-        retstart += retmax
-        if retstart >= int(record["Count"]) or retstart >= max_results:
+        retstart += 1000
+        if retstart >= int(record.get("count", 0)) or retstart >= max_results:
             break
         time.sleep(0.3)
     return pmids
@@ -160,35 +163,31 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
 def fetch_metadata(pmids):
     if not pmids:
         return []
-    Entrez.email = ENTREZ_EMAIL
-    records = []
+    papers = []
     for i in range(0, len(pmids), 200):
         chunk = pmids[i:i+200]
-        handle = Entrez.efetch(db="pubmed", id=",".join(chunk), rettype="medline", retmode="text")
-        recs = list(Medline.parse(handle))
-        handle.close()
-        records.extend(recs)
+        params = {"db": "pubmed", "id": ",".join(chunk), "retmode": "json",
+                  "email": ENTREZ_EMAIL}
+        result = requests.get(ESUMMARY_URL, params=params, timeout=60).json()["result"]
+        for pmid in chunk:
+            rec = result.get(pmid)
+            if not rec:
+                continue
+            authors = [a.get("name", "").strip()
+                       for a in rec.get("authors", []) if a.get("name")]
+            if not authors:
+                continue
+            doi = next((a.get("value") for a in rec.get("articleids", [])
+                        if a.get("idtype") == "doi"), None)
+            papers.append({
+                "doi": doi,
+                "title": rec.get("title", ""),
+                "authors": authors,
+                "journal": rec.get("fulljournalname", ""),
+                "date": rec.get("pubdate", ""),
+                "pmid": pmid,
+            })
         time.sleep(0.3)
-
-    papers = []
-    for rec in records:
-        authors = rec.get("AU", [])
-        pmid = rec.get("PMID", "").strip()
-        if not authors or not pmid:
-            continue
-        doi = None
-        for id_ in rec.get("AID", []):
-            if id_.endswith(" [doi]"):
-                doi = id_.replace(" [doi]", "")
-                break
-        papers.append({
-            "doi": doi,
-            "title": rec.get("TI", ""),
-            "authors": authors,
-            "journal": rec.get("JT", ""),
-            "date": rec.get("DP", ""),
-            "pmid": pmid,
-        })
     return papers
 
 # =============================================================================

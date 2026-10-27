@@ -1,4 +1,3 @@
-biopython
 requests
 apify-client
 python-dotenv

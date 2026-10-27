@@ -2,55 +2,48 @@ Daily Digest
 ============
 
 Daily scoping review of gene-therapy literature (PubMed + Reddit top post),
-delivered to Telegram. Runs on an Android phone under Termux at 20:00 UTC
-(DeepSeek off-peak). GitHub is just the code repo — secrets and per-device
-state stay on the phone.
+delivered to Telegram. Runs once a day on a Linux laptop, scheduled with cron
+at 20:00 UTC (DeepSeek off-peak), then exits. GitHub is just the code repo —
+secrets and per-machine state stay on the laptop.
 
 
 Repo layout
 -----------
 
 daily_digest.py         The program.
-run.sh                  Phone wrapper: git pull, wake lock, run.
-setup_local.sh          One-time phone setup (creates .env, sources.txt, logs/).
+run.sh                  Launcher: git pull, then one run.
+setup_local.sh          One-time setup (creates .env, sources.txt, logs/).
 .env.example            Template for secrets.
 sources.txt.example     Template for terms / subreddits / authors.
-.gitignore              Keeps secrets and per-device state out of git.
+.gitignore              Keeps secrets and per-machine state out of git.
 MIT license             Free for use and adaptation.
 
+Only three small Python dependencies (no numpy / biopython):
+requests, apify-client, python-dotenv.
 
-Phone setup (Termux, one-time)
+
+Laptop setup (Linux, one-time)
 ------------------------------
 
-1. Install packages:
-
-       pkg update && pkg upgrade
-       pkg install python git termux-api cronie
-       pkg install python-numpy
-       termux-setup-storage
-
-   python-numpy is only there to help biopython build; termux-setup-storage
-   is optional (only needed if you want logs on shared storage).
-
-2. Clone and install Python deps:
+1. Clone and install Python deps:
 
        git clone <your-repo> ~/daily_digest
        cd ~/daily_digest
        pip install -r requirements.txt
 
-3. Create local config:
+2. Create local config:
 
        ./setup_local.sh
 
    This copies .env.example -> .env and sources.txt.example -> sources.txt
    (only if they don't already exist) and makes the shell scripts executable.
 
-4. Fill them in:
+3. Fill them in:
 
        nano .env
        nano sources.txt
 
-5. Smoke test:
+4. Smoke test:
 
        ./run.sh
 
@@ -58,35 +51,25 @@ Phone setup (Termux, one-time)
 Scheduling
 ----------
 
-Cronie must be running. Android kills it on reboot, so start it from a boot
-script. That boot script does nothing else — no Python, no git, no delay.
-
-    mkdir -p ~/.termux/boot
-    cat > ~/.termux/boot/start-crond <<'EOF'
-    #!/data/data/com.termux/files/usr/bin/bash
-    pgrep -x crond >/dev/null || crond
-    EOF
-    chmod +x ~/.termux/boot/start-crond
-
-Install Termux:Boot from F-Droid, open it once from the launcher, and set
-battery optimisation to Unrestricted for both Termux and Termux:Boot
-(Settings -> Apps -> Termux -> Battery -> Unrestricted).
-
-Then install the 20:00 UTC cron entry:
+Add an entry to the system crontab:
 
     crontab -e
 
-Add this line:
+Add these lines:
 
     TZ=UTC
-    0 20 * * * /data/data/com.termux/files/home/daily_digest/run.sh >> /data/data/com.termux/files/home/daily_digest/logs/cron.log 2>&1
+    0 20 * * * $HOME/daily_digest/run.sh >> $HOME/daily_digest/logs/cron.log 2>&1
 
-TZ=UTC is required: without it, the cron line fires at 20:00 local time
-(19:00 UTC in Irish summer time), not 20:00 UTC.
+- run.sh runs the job once, then exits — nothing stays running in the
+  background.
+- TZ=UTC is required: without it, the job fires at 20:00 local time, which
+  drifts from 20:00 UTC across DST.
+- Make sure the cron daemon is enabled so it survives reboots:
+
+      sudo systemctl enable --now cron     # Debian/Ubuntu
 
 Verify it registered:
 
-    pgrep -l crond
     crontab -l
 
 
