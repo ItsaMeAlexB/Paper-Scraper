@@ -12,7 +12,7 @@ Repo layout
 -----------
 
 daily_digest.py         The program.
-run.sh                  Launcher: git pull, then one run.
+run.sh                  Launcher: run once, then exit.
 setup_local.sh          One-time setup (creates .env, sources.txt, logs/).
 .env.example            Template for secrets.
 sources.txt.example     Template for terms / subreddits / authors.

@@ -316,7 +316,7 @@ def deepseek_scoping_review(term_name, papers, named_papers):
         section(f"NAMED-AUTHOR PAPERS ({named_start}–{named_end})", named_start, named_end),
     ])
 
-    prompt = f"""You are writing a scoping review of recent gene therapy literature for a researcher who already knows the search term "{term_name}" well. The papers below are in two sections: a PubMed topic search, and papers by named authors. Summarise them in one naturally flowing paragraph.
+    prompt = f"""You are writing a scoping review of recent gene therapy literature for a researcher who already knows the search term "{term_name}" to an extent. The papers below are in two sections: a PubMed topic search, and papers by named authors. Summarise them in one naturally flowing paragraph.
 
 Rules for the TOPIC-SEARCH section only — keep primary research articles relevant to gene therapy:
 - Relevant means a novel or field-advancing contribution — e.g. a new Cas variant, a new vector, or a finding such as RNA-seq being unchanged by vector dosing.
@@ -329,16 +329,17 @@ Rules for the TOPIC-SEARCH section only — keep primary research articles relev
 Rules for the NAMED-AUTHOR section — these papers are MANDATORY. Every one of them must be weaved into the paragraph. They are exempt from the relevance, novelty, and paper-mill filtering above; the reader follows these labs regardless.
 
 Length:
-- Write at least 10 sentences and at most 20.
+- Write at least 5 sentences and at most 15.
 - Do not default to the upper end. Choose the length the material actually needs.
-- If there are fewer than 100 papers, or few significant papers, or the material is easy to summarise briefly, stay at 10 sentences.
-- Only if there are 200 or more papers, or the work requires a lot of explaining, or there are many genuinely good papers, may you use up to 20.
+- If there are fewer than 50 papers, or few significant papers, or the material is easy to summarise briefly, stay at 5 sentences.
+- Only if there are 100 or more papers, or the work requires a lot of explaining, or there are many genuinely good papers, may you use up to 15.
 
 Style:
 - Refer to each paper by its lab (last author), e.g. "the Liu lab".
 - Cite ACS-style: immediately after the claim it supports and BEFORE the closing punctuation, write that paper's number in double square brackets, e.g. "…engineered a new non-viral vector [[REF:4]]."
 - Use the numbers exactly as shown in the paper lists. Never write a URL, a DOI, a PMID, or any HTML.
-- Assume the reader is comfortable with "{term_name}" itself, so keep technical terms rather than simplifying them away; but briefly explain any niche abbreviation, complex term, concept, or jargon in-line the first time it appears.
+- Assume the reader is comfortable with "{term_name}" itself, so keep technical terms rather than simplifying them away; but it is important to briefly explain any niche abbreviation, complex term, concept, or jargon in-line the first time it appears. If it is ambiguous or you don't understand, don't hallucinate or guess, just use the phrasing/term/abbreviation/etc. as is and forgo an explanation.
+- Do not break the fourth wall, do not comment for example on a lack of papers (just pick what is significant and meet the minimum sentences), do not mention there are no named-author papers, etc.
 
 Papers:
 
