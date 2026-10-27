@@ -494,15 +494,13 @@ def run_digest(run_date, now):
     else:
         problems.append("Scoping review: no summary produced")
 
-    # Reddit message.
+    # Reddit message: just the post link.
     if valid_post:
-        title = valid_post.get("title", "No title")
-        upvotes = valid_post.get("upVotes") or valid_post.get("score") or 0
-        author = valid_post.get("authorName", "unknown")
         post_url = valid_post.get("postUrl") or valid_post.get("url")
-        send_telegram(f"{title}, r/{subreddit}, {upvotes} upvotes, u/{author}")
         if post_url:
             send_telegram(post_url)
+        else:
+            send_telegram(valid_post.get("title", "No title"))
 
     return problems
 
@@ -514,6 +512,12 @@ def main():
     try:
         now = datetime.now(timezone.utc)
         logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Deliver only within the 12:00-24:00 UTC window. A periodic cron tick
+        # retries, so the first tick the laptop is available in-window sends it.
+        if not (12 <= now.hour < 24):
+            logger.info(f"Outside 12:00-24:00 UTC window (hour {now.hour}); will retry later")
+            return
 
         days_since = days_since_last_sent()
         if days_since == 0:
