@@ -42,6 +42,18 @@ Setup (Linux, one-time)
    `run.sh` prefers `.venv/bin/python3` when it exists, so cron needs no extra
    configuration.
 
+   If the image has no `python3-venv` and no `pip` at all (common on minimal
+   VPS images), those two commands fail with PEP 668 errors. Without root,
+   bootstrap pip into your home directory instead:
+
+       curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+       python3 /tmp/get-pip.py --user --break-system-packages
+       python3 -m pip install --user --break-system-packages -r requirements.txt
+
+   `--user` keeps everything inside `~/.local`, so nothing system-wide is
+   touched. `run.sh` then falls back to the system `python3`, which already sees
+   user site-packages.
+
 2. Create local config:
 
        ./setup_local.sh
