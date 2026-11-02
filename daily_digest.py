@@ -141,6 +141,27 @@ def build_query(term):
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
+def _ncbi_json(url, params, attempts=2):
+    """GET an E-utilities JSON endpoint. NCBI intermittently answers with an
+    error payload instead of the expected key; one bad response must not kill an
+    unattended run, so retry once and hand back {} rather than raising."""
+    name = url.rsplit("/", 1)[-1]
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"NCBI {name} failed: {e} (attempt {attempt}/{attempts})")
+        else:
+            if data.get("error"):
+                logger.warning(f"NCBI {name} error payload: {str(data['error'])[:200]}")
+            else:
+                return data
+        time.sleep(2)
+    logger.error(f"NCBI {name} gave up after {attempts} attempts")
+    return {}
+
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
     start_str = start_date.strftime("%Y/%m/%d")
     end_str = end_date.strftime("%Y/%m/%d")
@@ -157,7 +178,7 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
             "retstart": retstart, "retmax": 1000, "sort": "pub date",
             "retmode": "json", "email": ENTREZ_EMAIL,
         }
-        record = requests.get(ESEARCH_URL, params=params, timeout=60).json()["esearchresult"]
+        record = _ncbi_json(ESEARCH_URL, params).get("esearchresult", {})
         batch = record.get("idlist", [])
         if not batch:
             break
@@ -176,7 +197,10 @@ def fetch_metadata(pmids):
         chunk = pmids[i:i+200]
         params = {"db": "pubmed", "id": ",".join(chunk), "retmode": "json",
                   "email": ENTREZ_EMAIL}
-        result = requests.get(ESUMMARY_URL, params=params, timeout=60).json()["result"]
+        result = _ncbi_json(ESUMMARY_URL, params).get("result", {})
+        if not result:
+            logger.warning(f"esummary returned nothing for {len(chunk)} pmid(s)")
+            continue
         for pmid in chunk:
             rec = result.get(pmid)
             if not rec:
