@@ -41,6 +41,7 @@ RUN_HOUR_UTC = 5          # off-peak window is 04:00-06:00 UTC
 TELEGRAM_LIMIT = 4096     # characters per Telegram message
 REVIEW_CHAR_CAP = 4096    # character cap handed to the model
 NCBI_TOOL = "paper-scraper"   # E-utilities identification; reduces throttling
+NCBI_DELAY = 0.5              # seconds between E-utilities calls (NCBI asks <=3/s)
 
 # =============================================================================
 # LOGGING (weekly overwrite)
@@ -142,24 +143,29 @@ def build_query(term):
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
-def _ncbi_json(url, params, attempts=2):
+def _ncbi_json(url, params, attempts=3):
     """GET an E-utilities JSON endpoint. NCBI intermittently answers with an
-    error payload instead of the expected key; one bad response must not kill an
-    unattended run, so retry once and hand back {} rather than raising."""
+    error payload or a 429 instead of the expected key; one bad response must not
+    kill an unattended run, so back off, retry, then degrade to {}."""
     name = url.rsplit("/", 1)[-1]
     for attempt in range(1, attempts + 1):
+        wait = 2 ** attempt                     # 2s, 4s, 8s
         try:
             resp = requests.get(url, params=params, timeout=60)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After", "")
+                wait = int(retry_after) if retry_after.isdigit() else wait
+                raise RuntimeError("429 Too Many Requests")
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.warning(f"NCBI {name} failed: {e} (attempt {attempt}/{attempts})")
+            logger.warning(f"NCBI {name} attempt {attempt}/{attempts} failed: {e}")
         else:
-            if data.get("error"):
-                logger.warning(f"NCBI {name} error payload: {str(data['error'])[:200]}")
-            else:
+            if not data.get("error"):
                 return data
-        time.sleep(2)
+            logger.warning(f"NCBI {name} error payload: {str(data['error'])[:200]}")
+        if attempt < attempts:
+            time.sleep(wait)
     logger.error(f"NCBI {name} gave up after {attempts} attempts")
     return {}
 
@@ -187,7 +193,7 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
         retstart += 1000
         if retstart >= int(record.get("count", 0)) or retstart >= max_results:
             break
-        time.sleep(0.3)
+        time.sleep(NCBI_DELAY)
     return pmids
 
 def fetch_metadata(pmids):
@@ -220,7 +226,7 @@ def fetch_metadata(pmids):
                 "date": rec.get("pubdate", ""),
                 "pmid": pmid,
             })
-        time.sleep(0.3)
+        time.sleep(NCBI_DELAY)
     return papers
 
 EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -251,7 +257,7 @@ def fetch_abstracts(pmids):
                 parts.append(f"{label}: {text}" if label else text)
             if pmid and parts:
                 abstracts[pmid] = " ".join(parts)
-        time.sleep(0.3)
+        time.sleep(NCBI_DELAY)
 
     missing = len(pmids) - len(abstracts)
     if missing:
@@ -487,6 +493,7 @@ def run_digest(now):
             papers.append(p)
             fresh += 1
         logger.info(f"'{term}': {fresh} new paper(s)")
+        time.sleep(NCBI_DELAY)
     if not papers:
         problems.append(f"PubMed: zero papers for the {day} window")
 
@@ -500,6 +507,7 @@ def run_digest(now):
                 continue
             seen.add(key)
             named_papers.append(p)
+        time.sleep(NCBI_DELAY)
     logger.info(f"{len(named_papers)} named-author paper(s)")
 
     if not papers and not named_papers:
