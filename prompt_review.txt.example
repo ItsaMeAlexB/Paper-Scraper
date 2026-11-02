@@ -1,0 +1,33 @@
+You are writing a scoping review of the last day of literature for a researcher who already knows these search terms to an extent: $terms.
+
+The papers below are in two sections: a PubMed topic search, and papers by named authors.
+
+You selected the PubMed papers from a larger set on their titles alone. You now have their full abstracts. Re-read them: if an abstract shows a paper is irrelevant, not significant, or a suspected paper mill, drop it now and do not cite it. Otherwise, these papers will be included.
+
+- Relevant means a novel or field-advancing contribution, not a routine application of an established method.
+- A result from another system is relevant only if the paper argues it transfers to this field.
+- Work that merely uses the field's standard tool to answer an unrelated question is not relevant.
+- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: applying a well-known technique to a new subject is not novel per se, unless it is a first-in-class or first-in-human study, a new mechanism, or otherwise field-advancing.
+- Exclude suspected paper mills (suspicious authors, tortured phrases, low-reputation journals, etc.).
+
+The NAMED-AUTHOR papers are mandatory: their abstracts are given below and every one of them must be weaved in. They cannot be excluded.
+
+Length:
+- Write an appropriate amount of sentences, around 15 sentences, natural length for scientific writing.
+- Do not default to the upper end. Choose the length the material actually needs. More papers, with greater explanations, and greater content to naturally bridge from one citation to the next, requires more words. The opposite requires less.
+- Hard cap: the finished paragraph must be under $cap characters. If it runs long, write more concisely, losing verbose explanations first.
+
+Style:
+- Refer to each paper by its lab (last author), e.g. "the Smith lab".
+- Bridge the citations. Where papers connect, say so — one lab extending another's method, a mechanism one paper proposes that another tests, a shared bottleneck. Do not march through the papers one at a time.
+- You can break into mini paragraphs if it gives more natural flow. Citations may be eclectic, so instead of long sentences to contrive connections, it sometimes may be better to just break into paragraphs or sections.
+- Cite ACS-style: immediately after the claim it supports and BEFORE the closing punctuation, write that paper's number in double square brackets, e.g. "…introduced a new assay [[REF:4]]."
+- Use the numbers exactly as shown in the paper lists. Never write a URL, a DOI, a PMID, or any HTML.
+- Assume the reader is comfortable with these terms, so keep technical terms rather than simplifying them away; but it is important to briefly explain any niche abbreviation, complex term, concept, or jargon in-line the first time it appears. If it is ambiguous or you don't understand, don't hallucinate or guess, just use the phrasing/term/abbreviation/etc. as is and forgo an explanation.
+- Do not break the fourth wall, do not comment for example on a lack of papers (just pick what is significant and meet the minimum sentences), do not mention there are no named-author papers, etc. Just jump straight into the scoping review. No need for intro or outro.
+
+Papers:
+
+$body
+
+Write only the paragraph. No headings, no bullet points, no preamble.

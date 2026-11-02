@@ -1,0 +1,22 @@
+You are screening the last day of literature for a researcher who already knows these search terms to an extent: $terms.
+
+The papers below come from a PubMed topic search across all of those terms. Decide which papers are worth the researcher's time.
+
+Rules — keep primary research articles that matter to this field:
+- Relevant means a novel or field-advancing contribution, not a routine application of an established method.
+- A result from another system is relevant only if the paper argues it transfers to this field.
+- Work that merely uses the field's standard tool to answer an unrelated question is not relevant.
+- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: applying a well-known technique to a new subject is not novel per se, unless it is a first-in-class or first-in-human study, a new mechanism, or otherwise field-advancing.
+- Exclude suspected paper mills (suspicious authors, tortured phrases, low-reputation journals, etc.).
+
+Pick only the most relevant and significant papers. Diversity is key: if two papers pioneer a very similar method, only one needs to be picked.
+
+Output: a single JSON object and nothing else, for example:
+
+{"selected": [3, 7, 12]}
+
+List every paper number you are keeping, in the order they appear in the list below.
+
+Papers:
+
+$body

@@ -4,12 +4,14 @@ import sys
 import time
 import re
 import html
+import json
 import logging
 import traceback
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+from string import Template
 
 import requests
-from apify_client import ApifyClient
 from dotenv import load_dotenv
 
 # Base directory (script location)
@@ -23,37 +25,41 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
-APIFY_API_KEY = os.environ.get("APIFY_API")
 
 REQUIRED_ENV = ["DEEPSEEK_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
-                "ENTREZ_EMAIL", "APIFY_API"]
+                "ENTREZ_EMAIL"]
 
 LAST_SENT_FILE = os.path.join(BASE_DIR, "last_sent_date.txt")
 CONFIG_FILE = os.path.join(BASE_DIR, "sources.txt")
-LOG_FILE = os.path.join(BASE_DIR, "logs", "daily_digest.log")
-ROTATION_MARKER = os.path.join(BASE_DIR, "logs", ".last_rotation")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "daily_digest.log")
+ROTATION_MARKER = os.path.join(LOG_DIR, ".last_rotation")
 
 LOG_ROTATION_SECONDS = 7 * 24 * 3600  # 7 days
+
+RUN_HOUR_UTC = 5          # off-peak window is 04:00-06:00 UTC
+TELEGRAM_LIMIT = 4096     # characters per Telegram message
+REVIEW_CHAR_CAP = 4096    # character cap handed to the model
 
 # =============================================================================
 # LOGGING (weekly overwrite)
 # =============================================================================
 
 def setup_logging():
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
     now = time.time()
-    if os.path.exists(ROTATION_MARKER):
-        try:
-            with open(ROTATION_MARKER) as f:
-                last = float(f.read().strip())
-            if now - last > LOG_ROTATION_SECONDS:
-                with open(LOG_FILE, "w"):
-                    pass
-                with open(ROTATION_MARKER, "w") as f:
-                    f.write(str(now))
-        except Exception:
-            pass
-    else:
+    try:
+        with open(ROTATION_MARKER) as f:
+            last = float(f.read().strip())
+    except Exception:
+        last = None
+
+    if last is None or now - last > LOG_ROTATION_SECONDS:
+        # Truncate every log file, so disk use stays bounded by one rotation
+        # window however long the job keeps running.
+        for name in os.listdir(LOG_DIR):
+            if name.endswith(".log"):
+                open(os.path.join(LOG_DIR, name), "w").close()
         with open(ROTATION_MARKER, "w") as f:
             f.write(str(now))
 
@@ -88,39 +94,37 @@ def load_config():
     if not os.path.exists(CONFIG_FILE):
         logger.error(
             f"Config file {CONFIG_FILE} not found. Copy sources.txt.example "
-            f"to sources.txt and fill in [TERMS], [SUBREDDITS], and [AUTHORS]."
+            f"to sources.txt and fill in [TERMS] and [AUTHORS]."
         )
         sys.exit(1)
     with open(CONFIG_FILE) as f:
         lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
-    terms, subreddits, authors = [], [], []
+    terms, authors = [], []
     current = None
     for line in lines:
         if line.startswith("[TERMS]"):
             current = "terms"
             continue
-        elif line.startswith("[SUBREDDITS]"):
-            current = "subreddits"
-            continue
         elif line.startswith("[AUTHORS]"):
             current = "authors"
             continue
+        elif line.startswith("[SUBREDDITS]"):
+            current = None      # retired section; tolerated so old configs still load
+            continue
         if current == "terms":
             terms.append(line)
-        elif current == "subreddits":
-            subreddits.append(line)
         elif current == "authors":
             authors.append(line)
 
-    if not terms or not subreddits:
-        logger.error("Config must have at least one term and one subreddit.")
+    if not terms:
+        logger.error("Config must have at least one term.")
         sys.exit(1)
-    return terms, subreddits, authors
+    return terms, authors
 
-TERMS, SUBREDDITS, AUTHORS = load_config()
+TERMS, AUTHORS = load_config()
 AUTHOR_QUERIES = [f'"{a}"[AU]' for a in AUTHORS]
-logger.info(f"Loaded {len(TERMS)} terms, {len(SUBREDDITS)} subreddits, {len(AUTHORS)} authors")
+logger.info(f"Loaded {len(TERMS)} terms, {len(AUTHORS)} authors")
 
 # =============================================================================
 # PUBMED
@@ -146,6 +150,10 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
         params = {
             "db": "pubmed", "term": query,
             "mindate": start_str, "maxdate": end_str,
+            # edat = date the record entered PubMed. That is "new to us", and
+            # unlike pdat it is never month-granular, so a one-day window means
+            # one day. NCBI defaults to edat, but say it out loud.
+            "datetype": "edat",
             "retstart": retstart, "retmax": 1000, "sort": "pub date",
             "retmode": "json", "email": ENTREZ_EMAIL,
         }
@@ -190,15 +198,67 @@ def fetch_metadata(pmids):
         time.sleep(0.3)
     return papers
 
+EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+def fetch_abstracts(pmids):
+    """Return {pmid: abstract_text}. Papers efetch cannot resolve are simply
+    absent from the dict; the caller reports the gap."""
+    abstracts = {}
+    for i in range(0, len(pmids), 100):
+        chunk = pmids[i:i+100]
+        params = {"db": "pubmed", "id": ",".join(chunk), "rettype": "abstract",
+                  "retmode": "xml", "email": ENTREZ_EMAIL}
+        try:
+            resp = requests.get(EFETCH_URL, params=params, timeout=60)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.text)
+        except Exception as e:
+            logger.error(f"efetch error: {e}")
+            continue
+        for art in root.iter("PubmedArticle"):
+            pmid = (art.findtext("./MedlineCitation/PMID") or "").strip()
+            parts = []
+            for node in art.iterfind("./MedlineCitation/Article/Abstract/AbstractText"):
+                text = "".join(node.itertext()).strip()
+                if not text:
+                    continue
+                label = (node.get("Label") or "").strip()
+                parts.append(f"{label}: {text}" if label else text)
+            if pmid and parts:
+                abstracts[pmid] = " ".join(parts)
+        time.sleep(0.3)
+
+    missing = len(pmids) - len(abstracts)
+    if missing:
+        logger.warning(f"efetch returned no abstract for {missing} paper(s)")
+    return abstracts
+
 # =============================================================================
-# SCOPING REVIEW (single DeepSeek call)
+# DEEPSEEK
 # =============================================================================
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-# Reasoning model: the scoping-review task is judgement + prose, not structured
-# JSON, so chain-of-thought is an asset rather than a distraction. max_tokens
-# is not set: the reasoner picks its own output budget.
-DEEPSEEK_MODEL = "deepseek-reasoner"
+# Triage is a structured selection task, so it runs on the cheaper chat model in
+# JSON mode. The review is judgement + prose, so chain-of-thought is an asset and
+# it runs on the reasoner, which picks its own output budget (no max_tokens).
+DEEPSEEK_CHAT_MODEL = "deepseek-chat"
+DEEPSEEK_REASONER_MODEL = "deepseek-reasoner"
+
+def load_prompt(filename):
+    """Prompts live beside the script, not in it. They are local-only files
+    (gitignored) created by setup_local.sh from the .example templates."""
+    path = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(path):
+        logger.error(
+            f"Prompt file {filename} not found. Copy {filename}.example to "
+            f"{filename} and edit it."
+        )
+        sys.exit(1)
+    with open(path, encoding="utf-8") as f:
+        return Template(f.read())
+
+TRIAGE_TEMPLATE = load_prompt("prompt_triage.txt")
+REVIEW_TEMPLATE = load_prompt("prompt_review.txt")
 
 # Model emits [[REF:n]]; we render the anchor. Tokens are tiny, so this saves
 # context and makes malformed HTML impossible by construction.
@@ -217,15 +277,20 @@ def _paper_link(p):
 def _last_author(p):
     return p["authors"][-1] if p.get("authors") else "Unknown"
 
-def _deepseek_text(prompt):
+def _deepseek_text(prompt, model=DEEPSEEK_REASONER_MODEL,
+                   response_format=None, max_tokens=None):
     """Run one DeepSeek call and return the response text. Retries once on an
     empty response; HTTP errors propagate."""
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                "Content-Type": "application/json"}
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
     }
+    if response_format:
+        payload["response_format"] = response_format
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
     last_err = None
     for attempt in (0, 1):
         resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=600)
@@ -264,7 +329,7 @@ def _visible(s):
 def _utf16_len(s):
     return len(s.encode("utf-16-le")) // 2   # Telegram counts UTF-16 units
 
-def _chunk_html(text, limit=3800):
+def _chunk_html(text, limit=TELEGRAM_LIMIT):
     """Split HTML into chunks whose visible UTF-16 length is <= limit. Anchors
     are atomic units, so a chunk can never end inside a tag."""
     chunks, cur, cur_len = [], [], 0
@@ -281,110 +346,56 @@ def _chunk_html(text, limit=3800):
         chunks.append("".join(cur).strip())
     return chunks
 
-def deepseek_scoping_review(term_name, papers, named_papers):
-    """Write a single scoping-review paragraph over all papers. Returns
-    (paragraph, {ref_number: url}) or (None, {})."""
-    if not papers and not named_papers:
-        return None, {}
+def _terms_label():
+    return ", ".join(TERMS)
 
-    entries, links = [], {}
+def _format_entry(n, paper, abstract=None):
+    line = (f"[{n}] {paper['title']} — {_last_author(paper)} — "
+            f"{paper.get('journal', 'Unknown')}")
+    if abstract is not None:
+        line += f"\nAbstract: {abstract}"
+    return line
 
-    def add(p):
-        n = len(entries) + 1
-        links[n] = _paper_link(p)
-        entries.append(
-            f"[{n}] {p['title']} — {_last_author(p)} — {p.get('journal', 'Unknown')}"
-        )
+def _block(header, lines):
+    return header + "\n" + ("\n".join(lines) if lines else "(none)")
 
-    topic_start = len(entries) + 1
-    for p in papers:
-        add(p)
-    topic_end = len(entries)
+def deepseek_pick(papers):
+    """Call 1: pick the topic papers worth reviewing, on titles alone.
+    `papers` is [(number, paper)]. Returns the kept subset in order. A parse
+    failure keeps everything — losing a whole digest is worse than a bad filter."""
+    if not papers:
+        return []
+    body = _block("TOPIC-SEARCH PAPERS", [_format_entry(n, p) for n, p in papers])
+    prompt = TRIAGE_TEMPLATE.safe_substitute(terms=_terms_label(), body=body)
+    text = _deepseek_text(prompt, model=DEEPSEEK_CHAT_MODEL,
+                          response_format={"type": "json_object"}, max_tokens=400)
 
-    named_start = len(entries) + 1
-    for p in named_papers:
-        add(p)
-    named_end = len(entries)
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        logger.error("Triage returned no JSON — keeping all papers")
+        return papers
+    try:
+        selected = {int(x) for x in json.loads(match.group(0)).get("selected", [])}
+    except Exception as e:
+        logger.error(f"Triage JSON unparseable ({e}) — keeping all papers")
+        return papers
+    return [(n, p) for n, p in papers if n in selected]
 
-    def section(header, lo, hi):
-        if lo > hi:
-            return f"{header}\n(none)"
-        return header + "\n" + "\n".join(entries[lo - 1:hi])
+def deepseek_review(topic, named, abstracts):
+    """Call 2: re-judge the selection against full abstracts and write the
+    review. `topic` and `named` are [(number, paper)]; numbers are shared with
+    call 1 so [[REF:n]] stays valid."""
+    def entries(pairs):
+        return [_format_entry(n, p, abstracts.get(p.get("pmid"), "Abstract unavailable."))
+                for n, p in pairs]
 
     body = "\n\n".join([
-        section(f"TOPIC-SEARCH PAPERS ({topic_start}–{topic_end})", topic_start, topic_end),
-        section(f"NAMED-AUTHOR PAPERS ({named_start}–{named_end})", named_start, named_end),
+        _block("TOPIC-SEARCH PAPERS", entries(topic)),
+        _block("NAMED-AUTHOR PAPERS", entries(named)),
     ])
-
-    prompt = f"""You are writing a scoping review of recent gene therapy literature for a researcher who already knows the search term "{term_name}" to an extent. The papers below are in two sections: a PubMed topic search, and papers by named authors. Summarise them in one naturally flowing paragraph.
-
-Rules for the TOPIC-SEARCH section only — keep primary research articles relevant to gene therapy:
-- Relevant means a novel or field-advancing contribution — e.g. a new Cas variant, a new vector, or a finding such as RNA-seq being unchanged by vector dosing.
-- A prokaryotic mechanism is relevant only if the paper states it is transferable to mammalian cells; a protein-folding model is relevant if Cas could be engineered from it.
-- Viral-vector work can be relevant, but vaccine work is not.
-- CRISPR used merely as a method for an unrelated question is not relevant.
-- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: using CRISPR/Cas9 on a new disease is not novel per se, since many diseases have been treated in vitro; it is novel only if it is a clinical trial, a new mechanism, disease-agnostic, or similarly field-advancing.
-- Exclude suspected paper mills (suspicious authors, tortured phrases, low-reputation journals, etc.).
-
-Rules for the NAMED-AUTHOR section — these papers are MANDATORY. Every one of them must be weaved into the paragraph. They are exempt from the relevance, novelty, and paper-mill filtering above; the reader follows these labs regardless.
-
-Length:
-- Write at least 5 sentences and at most 15.
-- Do not default to the upper end. Choose the length the material actually needs.
-- If there are fewer than 50 papers, or few significant papers, or the material is easy to summarise briefly, stay at 5 sentences.
-- Only if there are 100 or more papers, or the work requires a lot of explaining, or there are many genuinely good papers, may you use up to 15.
-
-Style:
-- Refer to each paper by its lab (last author), e.g. "the Liu lab".
-- Cite ACS-style: immediately after the claim it supports and BEFORE the closing punctuation, write that paper's number in double square brackets, e.g. "…engineered a new non-viral vector [[REF:4]]."
-- Use the numbers exactly as shown in the paper lists. Never write a URL, a DOI, a PMID, or any HTML.
-- Assume the reader is comfortable with "{term_name}" itself, so keep technical terms rather than simplifying them away; but it is important to briefly explain any niche abbreviation, complex term, concept, or jargon in-line the first time it appears. If it is ambiguous or you don't understand, don't hallucinate or guess, just use the phrasing/term/abbreviation/etc. as is and forgo an explanation.
-- Do not break the fourth wall, do not comment for example on a lack of papers (just pick what is significant and meet the minimum sentences), do not mention there are no named-author papers, etc.
-
-Papers:
-
-{body}
-
-Write only the paragraph. No headings, no bullet points, no preamble.
-"""
-    return _deepseek_text(prompt), links
-
-# =============================================================================
-# REDDIT (harshmaur/reddit-scraper)
-# =============================================================================
-
-def fetch_top_post(subreddit, days_back=7):
-    """Returns (post_or_None, error_string_or_None) for the single top post."""
-    if not APIFY_API_KEY:
-        logger.error("APIFY_API secret not set")
-        return None, "APIFY_API secret not set"
-    client = ApifyClient(APIFY_API_KEY)
-
-    if days_back <= 1:
-        time_filter = "day"
-    elif days_back <= 7:
-        time_filter = "week"
-    else:
-        time_filter = "month"
-    url = f"https://www.reddit.com/r/{subreddit}/top/?t={time_filter}"
-
-    run_input = {
-        "startUrls": [{"url": url}],
-        "maxPostsCount": 1,
-        "crawlCommentsPerPost": False,
-        "includeNSFW": False,
-        "fastMode": False,
-        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
-    }
-    try:
-        run = client.actor("harshmaur/reddit-scraper").call(run_input=run_input)
-        items = list(client.dataset(run.default_dataset_id).iterate_items())
-        posts = [i for i in items if i.get("dataType") == "post"]
-        logger.info(f"Retrieved {len(posts)} post(s) from r/{subreddit}")
-        return (posts[0] if posts else None), None
-    except Exception as e:
-        logger.error(f"Reddit fetch error: {e}")
-        return None, f"Reddit (Apify) error: {e}"
+    prompt = REVIEW_TEMPLATE.safe_substitute(terms=_terms_label(), body=body,
+                                             cap=REVIEW_CHAR_CAP)
+    return _deepseek_text(prompt)
 
 # =============================================================================
 # TELEGRAM
@@ -410,7 +421,9 @@ def send_telegram(message, parse_mode=None):
 # =============================================================================
 
 def days_since_last_sent():
-    """None = never sent. 0 = sent today (skip). N>=1 = N-1 days missed."""
+    """None = never sent. 0 = sent today (skip). N>=1 = last sent N days ago.
+    There is no catch-up: a missed day is skipped and the next run simply picks
+    up the newest window."""
     if not os.path.exists(LAST_SENT_FILE):
         return None
     try:
@@ -428,80 +441,67 @@ def mark_sent_today():
 # ONE DIGEST RUN
 # =============================================================================
 
-def run_digest(run_date, now):
-    """One digest run. run_date picks the rotation; windows reach back to
-    run_date - rotation_length, ending at run_date (for catch-up) or at now
-    (for today). Returns a list of problems."""
-    days_late = (now.date() - run_date.date()).days
-    is_today = (days_late == 0)
-    end_date = now if is_today else run_date
+def run_digest(now):
+    """One digest run over the single previous UTC day. Every term and every
+    named author is searched; there is no rotation. Returns a list of problems."""
     problems = []
+    day = (now - timedelta(days=1)).date()
+    logger.info(f"Window: {day} (1 day); {len(TERMS)} terms, {len(AUTHORS)} authors")
 
-    term_idx = run_date.toordinal() % len(TERMS)
-    sub_idx = run_date.toordinal() % len(SUBREDDITS)
-    term_name = TERMS[term_idx]
-    term_query = build_query(term_name)
-    subreddit = SUBREDDITS[sub_idx]
-    logger.info(f"[{run_date.date()}] term[{term_idx}]='{term_name}', "
-                f"sub[{sub_idx}]='{subreddit}', days_late={days_late}")
-
-    if not is_today:
-        send_telegram(f"📅 Catch-up digest for {run_date.strftime('%Y-%m-%d')}")
-
-    # Reddit: catch-up steps up from week to month tier.
-    M = len(SUBREDDITS)
-    days_back = M if is_today else 8
-    valid_post, apify_err = fetch_top_post(subreddit, days_back=days_back)
-    if apify_err:
-        problems.append(apify_err)
-    if valid_post:
-        logger.info(f"[{run_date.date()}] Reddit: '{valid_post.get('title')}' "
-                    f"({valid_post.get('upVotes')} upvotes)")
-    else:
-        problems.append(f"Reddit: no post found for r/{subreddit}")
-
-    # PubMed: term search ends at end_date so today's papers aren't doubled.
-    N = len(TERMS)
-    term_start = run_date - timedelta(days=N)
-    pmids = fetch_all_pmids(term_query, term_start, end_date)
-    papers = fetch_metadata(pmids) if pmids else []
-    logger.info(f"[{run_date.date()}] {len(papers)} papers for '{term_name}'")
+    # Topic search: every term, deduped globally so two terms cannot give the
+    # same paper two numbers.
+    papers, seen = [], set()
+    for term in TERMS:
+        pmids = fetch_all_pmids(build_query(term), day, day)
+        fresh = 0
+        for p in (fetch_metadata(pmids) if pmids else []):
+            key = _paper_key(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            papers.append(p)
+            fresh += 1
+        logger.info(f"'{term}': {fresh} new paper(s)")
     if not papers:
-        problems.append(f"PubMed: zero papers for term '{term_name}'")
+        problems.append(f"PubMed: zero papers for the {day} window")
 
-    # Named authors (last day of the run's window).
-    auth_start = run_date - timedelta(days=1)
+    # Named authors: mandatory, never triaged out.
     named_papers = []
-    for auth_q in AUTHOR_QUERIES:
-        auth_pmids = fetch_all_pmids(auth_q, auth_start, end_date)
-        if auth_pmids:
-            named_papers.extend(fetch_metadata(auth_pmids))
-    seen = {_paper_key(p) for p in papers}
-    named_papers = [p for p in named_papers if _paper_key(p) not in seen]
-    logger.info(f"[{run_date.date()}] {len(named_papers)} named-author papers")
+    for query in AUTHOR_QUERIES:
+        pmids = fetch_all_pmids(query, day, day)
+        for p in (fetch_metadata(pmids) if pmids else []):
+            key = _paper_key(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            named_papers.append(p)
+    logger.info(f"{len(named_papers)} named-author paper(s)")
 
-    # Scoping review.
-    summary, links = None, {}
-    if papers or named_papers:
-        try:
-            summary, links = deepseek_scoping_review(term_name, papers, named_papers)
-        except Exception as e:
-            logger.error(f"DeepSeek scoping-review error: {e}")
-            problems.append(f"Scoping review error: {e}")
+    if not papers and not named_papers:
+        return problems
 
-    if summary:
-        for chunk in _chunk_html(_render_citations(summary, links)):
-            send_telegram(chunk, parse_mode="HTML")
-    else:
-        problems.append("Scoping review: no summary produced")
+    # Numbering spans both calls so [[REF:n]] stays valid across them.
+    topic = list(enumerate(papers, 1))
+    named = list(enumerate(named_papers, len(papers) + 1))
+    links = {n: _paper_link(p) for n, p in topic + named}
 
-    # Reddit message: just the post link.
-    if valid_post:
-        post_url = valid_post.get("postUrl") or valid_post.get("url")
-        if post_url:
-            send_telegram(post_url)
-        else:
-            send_telegram(valid_post.get("title", "No title"))
+    kept = deepseek_pick(topic)
+    logger.info(f"Triage kept {len(kept)}/{len(topic)} topic paper(s)")
+    if not kept and not named:
+        problems.append("Triage kept no papers")
+        return problems
+
+    selected = kept + named
+    abstracts = fetch_abstracts([p["pmid"] for _, p in selected if p.get("pmid")])
+    no_abstract = [n for n, p in selected if p.get("pmid") not in abstracts]
+    if no_abstract:
+        problems.append(f"No abstract for paper(s) {no_abstract}")
+
+    summary = deepseek_review(kept, named, abstracts)
+    rendered = _render_citations(summary, links)
+    logger.info(f"Review: {len(_visible(rendered))} chars")
+    for chunk in _chunk_html(rendered):
+        send_telegram(chunk, parse_mode="HTML")
 
     return problems
 
@@ -514,42 +514,24 @@ def main():
         now = datetime.now(timezone.utc)
         logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # Deliver only within the 12:00-24:00 UTC window. A periodic cron tick
-        # retries, so the first tick the laptop is available in-window sends it.
-        if not (12 <= now.hour < 24):
-            logger.info(f"Outside 12:00-24:00 UTC window (hour {now.hour}); will retry later")
+        # One daily slot, inside the 04:00-06:00 UTC DeepSeek off-peak window.
+        # Cron fires once at 05:00; there is no retry and no catch-up, so a
+        # failed day is simply skipped.
+        if now.hour != RUN_HOUR_UTC:
+            logger.info(f"Outside {RUN_HOUR_UTC:02d}:00 UTC; will retry later")
             return
 
-        days_since = days_since_last_sent()
-        if days_since == 0:
+        if days_since_last_sent() == 0:
             logger.info("Already sent today, skipping")
             return
 
-        if days_since is None or days_since == 1:
-            run_dates = [now]                                     # normal / first run
-        elif days_since == 2:
-            run_dates = [now - timedelta(days=1), now]            # one catch-up
-        else:
-            logger.info(f"{days_since - 1} day(s) missed — replaying today only; "
-                        f"backlog ignored")
-            run_dates = [now]
+        problems = run_digest(now)
 
-        logger.info(f"Runs: {[d.strftime('%Y-%m-%d') for d in run_dates]}")
-
-        all_problems = []
-        for run_date in run_dates:
-            try:
-                all_problems.extend(run_digest(run_date, now))
-            except Exception as e:
-                logger.error(f"Run {run_date.date()} crashed: {e}")
-                logger.error(traceback.format_exc())
-                all_problems.append(f"Run {run_date.date()}: {e}")
-
-        if all_problems:
-            send_telegram("⚠️ Digest issues:\n- " + "\n- ".join(all_problems))
+        if problems:
+            send_telegram("⚠️ Digest issues:\n- " + "\n- ".join(problems))
 
         mark_sent_today()
-        logger.info("All digests sent.")
+        logger.info("Digest sent.")
 
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Daily Digest launcher — Linux laptop. Runs once, then exits.
+# Daily Digest launcher — runs once, then exits.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 mkdir -p logs

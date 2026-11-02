@@ -1,6 +1,8 @@
 # Local-only: secrets and per-device state
 .env
 sources.txt
+prompt_triage.txt
+prompt_review.txt
 last_sent_date.txt
 logs/
 

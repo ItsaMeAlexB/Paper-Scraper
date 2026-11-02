@@ -1,30 +1,35 @@
 Daily Digest
 ============
 
-Daily scoping review of gene-therapy literature (PubMed + Reddit top post),
-delivered to Telegram. Runs once a day on a Linux laptop: a light cron check
-every 15 minutes delivers the digest the first time you're on during
-12:00-24:00 UTC, then skips until the next day. GitHub is just the code repo —
-secrets and per-machine state stay on the laptop.
+Daily scoping review of gene-therapy literature (PubMed), delivered to
+Telegram. Every search term and every named author is queried for the previous
+UTC day, then two DeepSeek calls turn the results into one scoping-review
+paragraph with clickable citations. Runs once a day at 05:00 UTC; GitHub is just
+the code repo — secrets and per-machine state stay on the machine.
 
 
 Repo layout
 -----------
 
-daily_digest.py         The program.
-run.sh                  Launcher: run once, then exit.
-setup_local.sh          One-time setup (creates .env, sources.txt, logs/).
-.env.example            Template for secrets.
-sources.txt.example     Template for terms / subreddits / authors.
-.gitignore              Keeps secrets and per-machine state out of git.
-MIT license             Free for use and adaptation.
+daily_digest.py             The program.
+run.sh                      Launcher: run once, then exit.
+setup_local.sh              One-time setup (creates the local files below).
+.env.example                Template for secrets.
+sources.txt.example         Template for terms / authors.
+prompt_triage.txt.example   Template for call 1: pick the significant papers.
+prompt_review.txt.example   Template for call 2: write the review.
+.gitignore                  Keeps secrets and per-machine state out of git.
+MIT license                 Free for use and adaptation.
 
-Only three small Python dependencies (no numpy / biopython):
-requests, apify-client, python-dotenv.
+Four local files are created by setup_local.sh and never committed:
+`.env`, `sources.txt`, `prompt_triage.txt`, `prompt_review.txt`.
+
+Only two small Python dependencies (no numpy / biopython):
+requests, python-dotenv.
 
 
-Laptop setup (Linux, one-time)
-------------------------------
+Setup (Linux, one-time)
+-----------------------
 
 1. Clone and install Python deps:
 
@@ -36,26 +41,31 @@ Laptop setup (Linux, one-time)
 
        ./setup_local.sh
 
-   This copies .env.example -> .env and sources.txt.example -> sources.txt
-   (only if they don't already exist) and makes the shell scripts executable.
+   This copies each `.example` file to its local name (only if it doesn't
+   already exist) and makes the shell scripts executable.
 
 3. Fill them in:
 
        nano .env
        nano sources.txt
+       nano prompt_triage.txt
+       nano prompt_review.txt
 
 4. Smoke test:
 
        ./run.sh
 
+   Outside the 05:00 UTC hour this exits immediately by design — check
+   `logs/daily_digest.log` for the `Outside 05:00 UTC` line. Inside that hour it
+   sends a real digest and marks the day done.
+
 
 Scheduling
 ----------
 
-The digest is delivered at the first opportunity within the 12:00-24:00 UTC
-window. A light cron tick fires every 15 minutes all day; `daily_digest.py`
-returns immediately unless it is inside the window and today's digest hasn't
-been sent yet, so it sends once per day no matter when the laptop is on.
+The digest is sent once a day at 05:00 UTC — inside DeepSeek's 04:00-06:00 UTC
+off-peak window. One cron entry fires, `daily_digest.py` runs, and the machine
+goes back to doing nothing until the next 05:00. No daemon, no resident process.
 
 Add an entry to the system crontab:
 
@@ -64,12 +74,16 @@ Add an entry to the system crontab:
 Add these lines:
 
     TZ=UTC
-    */15 * * * * $HOME/daily_digest/run.sh >> $HOME/daily_digest/logs/cron.log 2>&1
+    0 5 * * * $HOME/daily_digest/run.sh
 
-- Each tick exits immediately — no background process or resident daemon; the
-  send happens at most once per day.
-- The 12:00-24:00 UTC check is DST-proof because `daily_digest.py` gates on
-  UTC time itself; the TZ=UTC line just sets the job's timezone environment.
+- One process start per day. `run.sh` captures stdout/stderr, so cron has
+  nothing to mail and no extra redirect is needed.
+- The hour check inside `daily_digest.py` still guards manual runs; the TZ=UTC
+  line just sets the job's timezone environment, so DST never shifts the slot.
+- If the machine is off or the run fails, that day is skipped. The next run
+  covers its own yesterday; nothing is replayed and nothing is queued.
+- Logs are truncated every 7 days, so disk use is the same after six months as
+  after two days.
 - Make sure the cron daemon is enabled so it survives reboots:
 
       sudo systemctl enable --now cron     # Debian/Ubuntu
@@ -79,21 +93,35 @@ Verify it registered:
     crontab -l
 
 
+What a run does
+---------------
+
+1. Every term in `[TERMS]` is searched, then every author in `[AUTHORS]`, over
+   the single previous UTC day. A paper hit by two terms is kept once.
+2. Call 1 (`deepseek-chat`) sees titles, last authors and journals only, and
+   returns the numbers worth reviewing (`prompt_triage.txt`). Named-author
+   papers are never triaged out. If the call fails or its JSON is unparseable,
+   every paper is kept.
+3. Abstracts for the surviving papers are fetched from PubMed.
+4. Call 2 (`deepseek-reasoner`) re-reads the selection with full abstracts,
+   drops anything the abstract weakens, and writes one scoping-review
+   paragraph under 4,096 characters (`prompt_review.txt`).
+5. Citations arrive as `[[REF:n]]` and are rendered into clickable links. The
+   message is split only if it somehow exceeds Telegram's 4,096-character limit.
+
+
 Missed-day behaviour
 --------------------
 
-- Sent today                -> skip.
-- Sent yesterday            -> normal run.
-- Sent exactly one day    -> two runs in the next window: the missed day (term
-                             window N+1 ending yesterday, Reddit month
-                             tier) followed by today's normal run.
-- Missed two or more days   -> today's run only; backlog logged and ignored.
+- Sent today     -> skip.
+- Not sent today -> normal run over yesterday.
+- Missed a day   -> nothing happens; the next run covers its own yesterday and
+                    the missed day is simply not reported.
 
 
 Rotating secrets
 ----------------
 
-Rotate the DeepSeek API key, the Telegram bot token (via /revoke in
-@BotFather), and the Apify token if any of them were ever committed or
-shared. .gitignore protects future commits; it does not remove anything
-from git history.
+Rotate the DeepSeek API key and the Telegram bot token (via /revoke in
+@BotFather) if either was ever committed or shared. .gitignore protects future
+commits; it does not remove anything from git history.
