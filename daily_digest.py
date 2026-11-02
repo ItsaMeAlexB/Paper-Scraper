@@ -40,6 +40,7 @@ LOG_ROTATION_SECONDS = 7 * 24 * 3600  # 7 days
 RUN_HOUR_UTC = 5          # off-peak window is 04:00-06:00 UTC
 TELEGRAM_LIMIT = 4096     # characters per Telegram message
 REVIEW_CHAR_CAP = 4096    # character cap handed to the model
+NCBI_TOOL = "paper-scraper"   # E-utilities identification; reduces throttling
 
 # =============================================================================
 # LOGGING (weekly overwrite)
@@ -176,7 +177,7 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
             # one day. NCBI defaults to edat, but say it out loud.
             "datetype": "edat",
             "retstart": retstart, "retmax": 1000, "sort": "pub date",
-            "retmode": "json", "email": ENTREZ_EMAIL,
+            "retmode": "json", "email": ENTREZ_EMAIL, "tool": NCBI_TOOL,
         }
         record = _ncbi_json(ESEARCH_URL, params).get("esearchresult", {})
         batch = record.get("idlist", [])
@@ -196,7 +197,7 @@ def fetch_metadata(pmids):
     for i in range(0, len(pmids), 200):
         chunk = pmids[i:i+200]
         params = {"db": "pubmed", "id": ",".join(chunk), "retmode": "json",
-                  "email": ENTREZ_EMAIL}
+                  "email": ENTREZ_EMAIL, "tool": NCBI_TOOL}
         result = _ncbi_json(ESUMMARY_URL, params).get("result", {})
         if not result:
             logger.warning(f"esummary returned nothing for {len(chunk)} pmid(s)")
@@ -231,7 +232,7 @@ def fetch_abstracts(pmids):
     for i in range(0, len(pmids), 100):
         chunk = pmids[i:i+100]
         params = {"db": "pubmed", "id": ",".join(chunk), "rettype": "abstract",
-                  "retmode": "xml", "email": ENTREZ_EMAIL}
+                  "retmode": "xml", "email": ENTREZ_EMAIL, "tool": NCBI_TOOL}
         try:
             resp = requests.get(EFETCH_URL, params=params, timeout=60)
             resp.raise_for_status()
