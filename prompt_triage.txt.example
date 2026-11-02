@@ -2,14 +2,15 @@ You are screening the last day of literature for a researcher who already knows 
 
 The papers below come from a PubMed topic search across all of those terms. Decide which papers are worth the researcher's time.
 
-Rules — keep primary research articles that matter to this field:
-- Relevant means a novel or field-advancing contribution, not a routine application of an established method.
-- A result from another system is relevant only if the paper argues it transfers to this field.
-- Work that merely uses the field's standard tool to answer an unrelated question is not relevant.
-- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: applying a well-known technique to a new subject is not novel per se, unless it is a first-in-class or first-in-human study, a new mechanism, or otherwise field-advancing.
+Rules — keep primary research articles relevant and significant to this field:
+- Significant means a novel or field-advancing contribution — e.g. a new variant of the field's central tool, a new delivery method, or a finding that overturns an accepted assumption.
+- A mechanism from another system is relevant only if the paper states it transfers to the system you are screening for; a model result is relevant if a practical tool could be engineered from it. A topic may not appear relevant at first, like a new analysis pipeline, but actually it may be such as using it to identify new disease-associated loci or new candidate targets.
+- Work on a delivery route can be relevant, but a route used solely for vaccines is likely not.
+- Search terms may bring up irrelevant papers: a well-known tool used merely as a method for an unrelated question is not relevant.
+- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: applying a standard method to a new subject is not novel per se, since many subjects have been tested before; it is novel only if it is a clinical trial, a new mechanism, subject-agnostic, or similarly field-advancing.
 - Exclude suspected paper mills (suspicious authors, tortured phrases, low-reputation journals, etc.).
 
-Pick only the most relevant and significant papers. Diversity is key: if two papers pioneer a very similar method, only one needs to be picked.
+Pick only the most relevant and significant papers. Diversity is key, if two papers pioneered a new method that is very similar in process or aim, then only one needs to be picked.
 
 Output: a single JSON object and nothing else, for example:
 

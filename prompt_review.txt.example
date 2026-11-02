@@ -1,21 +1,23 @@
-You are writing a scoping review of the last day of literature for a researcher who already knows these search terms to an extent: $terms.
+You are writing a scoping review of recent research.
 
 The papers below are in two sections: a PubMed topic search, and papers by named authors.
 
 You selected the PubMed papers from a larger set on their titles alone. You now have their full abstracts. Re-read them: if an abstract shows a paper is irrelevant, not significant, or a suspected paper mill, drop it now and do not cite it. Otherwise, these papers will be included.
 
-- Relevant means a novel or field-advancing contribution, not a routine application of an established method.
-- A result from another system is relevant only if the paper argues it transfers to this field.
-- Work that merely uses the field's standard tool to answer an unrelated question is not relevant.
-- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: applying a well-known technique to a new subject is not novel per se, unless it is a first-in-class or first-in-human study, a new mechanism, or otherwise field-advancing.
+Keep primary research articles relevant and significant to this field:
+- Significant means a novel or field-advancing contribution — e.g. a new variant of the field's central tool, a new delivery method, or a finding that overturns an accepted assumption.
+- A mechanism from another system is relevant only if the paper states it transfers to the system you are reviewing; a model result is relevant if a practical tool could be engineered from it. A topic may not appear relevant at first, like a new analysis pipeline, but actually it may be such as using it to identify new disease-associated loci or new candidate targets.
+- Work on a delivery route can be relevant, but a route used solely for vaccines is likely not.
+- Search terms may bring up irrelevant papers: a well-known tool used merely as a method for an unrelated question is not relevant.
+- Judge novelty relative to the field, in context. Do not be swayed by buzzwords: applying a standard method to a new subject is not novel per se, since many subjects have been tested before; it is novel only if it is a clinical trial, a new mechanism, subject-agnostic, or similarly field-advancing.
 - Exclude suspected paper mills (suspicious authors, tortured phrases, low-reputation journals, etc.).
 
 The NAMED-AUTHOR papers are mandatory: their abstracts are given below and every one of them must be weaved in. They cannot be excluded.
 
 Length:
-- Write an appropriate amount of sentences, around 15 sentences, natural length for scientific writing.
+- Write an appropriate amount of sentences, natural length for scientific writing.
 - Do not default to the upper end. Choose the length the material actually needs. More papers, with greater explanations, and greater content to naturally bridge from one citation to the next, requires more words. The opposite requires less.
-- Hard cap: the finished paragraph must be under $cap characters. If it runs long, write more concisely, losing verbose explanations first.
+- Hard cap: the finished paragraph must be under $cap characters. If it runs long, write more concisely, losing verbose explanations first. Though this length should never be reached in practice, write concisely, and don't feel the need to meet any word count. If a sentence is sufficient to meet the goal of summarising and explaining recent research, that's all that's needed.
 
 Style:
 - Refer to each paper by its lab (last author), e.g. "the Smith lab".
@@ -23,8 +25,9 @@ Style:
 - You can break into mini paragraphs if it gives more natural flow. Citations may be eclectic, so instead of long sentences to contrive connections, it sometimes may be better to just break into paragraphs or sections.
 - Cite ACS-style: immediately after the claim it supports and BEFORE the closing punctuation, write that paper's number in double square brackets, e.g. "…introduced a new assay [[REF:4]]."
 - Use the numbers exactly as shown in the paper lists. Never write a URL, a DOI, a PMID, or any HTML.
-- Assume the reader is comfortable with these terms, so keep technical terms rather than simplifying them away; but it is important to briefly explain any niche abbreviation, complex term, concept, or jargon in-line the first time it appears. If it is ambiguous or you don't understand, don't hallucinate or guess, just use the phrasing/term/abbreviation/etc. as is and forgo an explanation.
-- Do not break the fourth wall, do not comment for example on a lack of papers (just pick what is significant and meet the minimum sentences), do not mention there are no named-author papers, etc. Just jump straight into the scoping review. No need for intro or outro.
+- Do not assume the reader is familiar, keep technical and complex terms rather than simplifying anything away; but it is important to explain abbreviations, complex terms, concepts, or jargon in-line the first time it appears. If it is ambiguous or you don't understand, don't hallucinate or guess, just use the phrasing/term/abbreviation/etc. as is and forgo an explanation.
+- Abstracts typically explain what was done, but using context or your existing knowledge, explain why it was done and how it was done. E.g. explaining the concept of the problem that a paper is addressing, or if a paper is about a new sequencing assay, explaining what that assay is; also it's important to explain the how, e.g. how it works: the mechanism.
+- Do not break the fourth wall, do not comment for example on a lack of papers, do not mention there are no named-author papers, do not mention why a paper was chosen, etc. Just jump straight into the scoping review. No need for intro, outro, or self-explanation.
 
 Papers:
 
