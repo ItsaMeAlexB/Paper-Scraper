@@ -31,11 +31,16 @@ requests, python-dotenv.
 Setup (Linux, one-time)
 -----------------------
 
-1. Clone and install Python deps:
+1. Clone and install Python deps into a venv (distros that refuse a system
+   `pip install` are the norm now):
 
-       git clone <your-repo> ~/daily_digest
-       cd ~/daily_digest
-       pip install -r requirements.txt
+       git clone https://github.com/ItsaMeAlexB/Paper-Scraper.git ~/Paper-Scraper
+       cd ~/Paper-Scraper
+       python3 -m venv .venv
+       .venv/bin/pip install -r requirements.txt
+
+   `run.sh` prefers `.venv/bin/python3` when it exists, so cron needs no extra
+   configuration.
 
 2. Create local config:
 
@@ -74,7 +79,7 @@ Add an entry to the system crontab:
 Add these lines:
 
     TZ=UTC
-    0 5 * * * $HOME/daily_digest/run.sh
+    0 5 * * * $HOME/Paper-Scraper/run.sh
 
 - One process start per day. `run.sh` captures stdout/stderr, so cron has
   nothing to mail and no extra redirect is needed.
