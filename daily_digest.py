@@ -25,6 +25,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
+NCBI_API_KEY = os.environ.get("NCBI_API_KEY")   # optional; lifts 3/s -> 10/s
 
 REQUIRED_ENV = ["DEEPSEEK_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
                 "ENTREZ_EMAIL"]
@@ -143,6 +144,15 @@ def build_query(term):
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
+def _eutils_params(**extra):
+    """Shared E-utilities params. An NCBI API key is optional, but when present
+    it lifts the rate limit from 3/s to 10/s."""
+    params = {"db": "pubmed", "email": ENTREZ_EMAIL, "tool": NCBI_TOOL}
+    if NCBI_API_KEY:
+        params["api_key"] = NCBI_API_KEY
+    params.update(extra)
+    return params
+
 def _ncbi_json(url, params, attempts=3):
     """GET an E-utilities JSON endpoint. NCBI intermittently answers with an
     error payload or a 429 instead of the expected key; one bad response must not
@@ -152,14 +162,18 @@ def _ncbi_json(url, params, attempts=3):
         wait = 2 ** attempt                     # 2s, 4s, 8s
         try:
             resp = requests.get(url, params=params, timeout=60)
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After", "")
-                wait = int(retry_after) if retry_after.isdigit() else wait
-                raise RuntimeError("429 Too Many Requests")
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.warning(f"NCBI {name} attempt {attempt}/{attempts} failed: {e}")
+            # Never interpolate the exception text: it embeds the request URL,
+            # and that URL carries the NCBI api_key.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429:
+                retry_after = e.response.headers.get("Retry-After", "")
+                if retry_after.isdigit():
+                    wait = int(retry_after)
+            detail = f"HTTP {status}" if status else type(e).__name__
+            logger.warning(f"NCBI {name} attempt {attempt}/{attempts} failed: {detail}")
         else:
             if not data.get("error"):
                 return data
@@ -175,16 +189,14 @@ def fetch_all_pmids(query, start_date, end_date, max_results=10000):
     pmids = []
     retstart = 0
     while True:
-        params = {
-            "db": "pubmed", "term": query,
-            "mindate": start_str, "maxdate": end_str,
+        params = _eutils_params(
+            term=query, mindate=start_str, maxdate=end_str,
             # edat = date the record entered PubMed. That is "new to us", and
             # unlike pdat it is never month-granular, so a one-day window means
             # one day. NCBI defaults to edat, but say it out loud.
-            "datetype": "edat",
-            "retstart": retstart, "retmax": 1000, "sort": "pub date",
-            "retmode": "json", "email": ENTREZ_EMAIL, "tool": NCBI_TOOL,
-        }
+            datetype="edat",
+            retstart=retstart, retmax=1000, sort="pub date", retmode="json",
+        )
         record = _ncbi_json(ESEARCH_URL, params).get("esearchresult", {})
         batch = record.get("idlist", [])
         if not batch:
@@ -202,8 +214,7 @@ def fetch_metadata(pmids):
     papers = []
     for i in range(0, len(pmids), 200):
         chunk = pmids[i:i+200]
-        params = {"db": "pubmed", "id": ",".join(chunk), "retmode": "json",
-                  "email": ENTREZ_EMAIL, "tool": NCBI_TOOL}
+        params = _eutils_params(id=",".join(chunk), retmode="json")
         result = _ncbi_json(ESUMMARY_URL, params).get("result", {})
         if not result:
             logger.warning(f"esummary returned nothing for {len(chunk)} pmid(s)")
@@ -237,8 +248,7 @@ def fetch_abstracts(pmids):
     abstracts = {}
     for i in range(0, len(pmids), 100):
         chunk = pmids[i:i+100]
-        params = {"db": "pubmed", "id": ",".join(chunk), "rettype": "abstract",
-                  "retmode": "xml", "email": ENTREZ_EMAIL, "tool": NCBI_TOOL}
+        params = _eutils_params(id=",".join(chunk), rettype="abstract", retmode="xml")
         try:
             resp = requests.get(EFETCH_URL, params=params, timeout=60)
             resp.raise_for_status()

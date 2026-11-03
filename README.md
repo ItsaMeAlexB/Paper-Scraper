@@ -68,6 +68,10 @@ Setup (Linux, one-time)
        nano prompt_triage.txt
        nano prompt_review.txt
 
+   `NCBI_API_KEY` is optional — free from
+   <https://account.ncbi.nlm.nih.gov/settings/> — and lifts PubMed's rate limit
+   from 3 to 10 requests per second. `ENTREZ_EMAIL` is required.
+
 4. Smoke test:
 
        ./run.sh
