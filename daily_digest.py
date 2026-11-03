@@ -176,7 +176,8 @@ def _ncbi_json(url, params, attempts=3):
             logger.warning(f"NCBI {name} attempt {attempt}/{attempts} failed: {detail}")
             if status == 400 and params.pop("api_key", None):
                 # A rejected key must not cost us the whole digest: drop it and
-                # retry immediately at the anonymous 3 req/s rate.
+                # retry. Pacing stays at NCBI_DELAY with or without a key, which
+                # sits inside the anonymous 3 req/s allowance.
                 logger.warning(f"NCBI {name} rejected the api_key; retrying without it")
                 continue
         else:
