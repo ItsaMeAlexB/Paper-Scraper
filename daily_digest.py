@@ -174,6 +174,11 @@ def _ncbi_json(url, params, attempts=3):
                     wait = int(retry_after)
             detail = f"HTTP {status}" if status else type(e).__name__
             logger.warning(f"NCBI {name} attempt {attempt}/{attempts} failed: {detail}")
+            if status == 400 and params.pop("api_key", None):
+                # A rejected key must not cost us the whole digest: drop it and
+                # retry immediately at the anonymous 3 req/s rate.
+                logger.warning(f"NCBI {name} rejected the api_key; retrying without it")
+                continue
         else:
             if not data.get("error"):
                 return data
