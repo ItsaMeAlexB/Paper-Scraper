@@ -1,7 +1,8 @@
+# Replace the placeholders with your own search terms and author names.
+# Lines starting with '#' and blank lines are ignored.
 [TERMS]
-gene therapy
-CRISPR
+<your first search term>
+<your second search term>
 
 [AUTHORS]
-Jennifer Doudna
-Feng Zhang
+<Author Name>
