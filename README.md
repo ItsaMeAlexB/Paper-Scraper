@@ -1,11 +1,11 @@
 Daily Digest
 ============
 
-Daily scoping review of gene-therapy literature (PubMed), delivered to
-Telegram. Every search term and every named author is queried for the previous
-UTC day, then two DeepSeek calls turn the results into one scoping-review
-paragraph with clickable citations. Runs once a day at 05:00 UTC; GitHub is just
-the code repo — secrets and per-machine state stay on the machine.
+Daily scoping review of new literature on whatever topic you configure (PubMed),
+delivered to Telegram. Every search term and every named author is queried for
+the previous UTC day, then two DeepSeek calls turn the results into one
+scoping-review paragraph with clickable citations. Runs once a day at 05:00 UTC;
+GitHub is just the code repo — secrets and per-machine state stay on the machine.
 
 
 Repo layout
@@ -85,8 +85,8 @@ Scheduling
 ----------
 
 The digest is sent once a day at 05:00 UTC — inside DeepSeek's 04:00-06:00 UTC
-off-peak window. One cron entry fires, `daily_digest.py` runs, and the machine
-goes back to doing nothing until the next 05:00. No daemon, no resident process.
+off-peak window. Cron fires, `daily_digest.py` runs, and the machine goes back
+to doing nothing until the next day. No daemon, no resident process.
 
 Add an entry to the system crontab:
 
@@ -95,12 +95,28 @@ Add an entry to the system crontab:
 Add these lines:
 
     TZ=UTC
-    0 5 * * * $HOME/Paper-Scraper/run.sh
+    0 6,7 * * * $HOME/Paper-Scraper/run.sh
 
-- One process start per day. `run.sh` captures stdout/stderr, so cron has
-  nothing to mail and no extra redirect is needed.
-- The hour check inside `daily_digest.py` still guards manual runs; the TZ=UTC
-  line just sets the job's timezone environment, so DST never shifts the slot.
+Why two hours, and why not `0 5 * * *`:
+
+- Ubuntu/Debian cron (vixie-cron) schedules in the machine's **local** time and
+  ignores `TZ=UTC` when reading the schedule; that variable only reaches the
+  job's environment. So `0 5 * * *` on a CET box fires at 05:00 local, which is
+  04:00 UTC, and the program's 05:00-UTC check aborts it. This is a real bug
+  that silently skipped a day.
+- `0 6,7 * * *` covers 05:00 UTC in both halves of the year: 06:00 local in
+  winter (CET, UTC+1) and 07:00 local in summer (CEST, UTC+2). Whichever slot
+  lands in the 05:00 UTC hour runs; the other exits immediately with the
+  `Outside 05:00 UTC` log line. DST never shifts the slot.
+- On a cron that supports `CRON_TZ=UTC` (cronie, i.e. RHEL/Fedora), use that one
+  line instead of the two slots:
+
+      CRON_TZ=UTC
+      0 5 * * * $HOME/Paper-Scraper/run.sh
+
+- `TZ=UTC` stays so the job's log timestamps are UTC too.
+- Two lightweight starts per day, one real digest. `run.sh` captures
+  stdout/stderr, so cron has nothing to mail and no extra redirect is needed.
 - If the machine is off or the run fails, that day is skipped. The next run
   covers its own yesterday; nothing is replayed and nothing is queued.
 - Logs are truncated every 7 days, so disk use is the same after six months as
