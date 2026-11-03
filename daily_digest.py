@@ -38,7 +38,6 @@ ROTATION_MARKER = os.path.join(LOG_DIR, ".last_rotation")
 
 LOG_ROTATION_SECONDS = 7 * 24 * 3600  # 7 days
 
-RUN_HOUR_UTC = 5          # off-peak window is 04:00-06:00 UTC
 TELEGRAM_LIMIT = 4096     # characters per Telegram message
 REVIEW_CHAR_CAP = 4096    # character cap handed to the model
 NCBI_TOOL = "paper-scraper"   # E-utilities identification; reduces throttling
@@ -563,13 +562,10 @@ def main():
         now = datetime.now(timezone.utc)
         logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # One daily slot, inside the 04:00-06:00 UTC DeepSeek off-peak window.
-        # Cron fires once at 05:00; there is no retry and no catch-up, so a
-        # failed day is simply skipped.
-        if now.hour != RUN_HOUR_UTC:
-            logger.info(f"Outside {RUN_HOUR_UTC:02d}:00 UTC; will retry later")
-            return
-
+        # Cron owns the schedule: one run a day at 06:30 machine-local time,
+        # which is 05:30 UTC in CET and 04:30 UTC in CEST — inside DeepSeek's
+        # 04:00-06:00 UTC weekday off-peak gap either way. No hour check here;
+        # the only guard is idempotency, so a second invocation cannot post twice.
         if days_since_last_sent() == 0:
             logger.info("Already sent today, skipping")
             return

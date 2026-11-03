@@ -4,8 +4,9 @@ Daily Digest
 Daily scoping review of new literature on whatever topic you configure (PubMed),
 delivered to Telegram. Every search term and every named author is queried for
 the previous UTC day, then two DeepSeek calls turn the results into one
-scoping-review paragraph with clickable citations. Runs once a day at 05:00 UTC;
-GitHub is just the code repo — secrets and per-machine state stay on the machine.
+scoping-review paragraph with clickable citations. Runs once a day at 06:30
+machine-local time; GitHub is just the code repo — secrets and per-machine state
+stay on the machine.
 
 
 Repo layout
@@ -76,17 +77,16 @@ Setup (Linux, one-time)
 
        ./run.sh
 
-   Outside the 05:00 UTC hour this exits immediately by design — check
-   `logs/daily_digest.log` for the `Outside 05:00 UTC` line. Inside that hour it
-   sends a real digest and marks the day done.
+   This sends a real digest and marks the day done. Running it again on the same
+   UTC day logs `Already sent today` and exits, so it is safe to invoke by hand.
 
 
 Scheduling
 ----------
 
-The digest is sent once a day at 05:00 UTC — inside DeepSeek's 04:00-06:00 UTC
-off-peak window. Cron fires, `daily_digest.py` runs, and the machine goes back
-to doing nothing until the next day. No daemon, no resident process.
+The digest is sent once a day at 06:30 machine-local time. One cron entry fires,
+`daily_digest.py` runs, and the machine goes back to doing nothing until the next
+day. No daemon, no resident process.
 
 Add an entry to the system crontab:
 
@@ -95,28 +95,24 @@ Add an entry to the system crontab:
 Add these lines:
 
     TZ=UTC
-    0 6,7 * * * $HOME/Paper-Scraper/run.sh
+    30 6 * * * $HOME/Paper-Scraper/run.sh
 
-Why two hours, and why not `0 5 * * *`:
-
-- Ubuntu/Debian cron (vixie-cron) schedules in the machine's **local** time and
-  ignores `TZ=UTC` when reading the schedule; that variable only reaches the
-  job's environment. So `0 5 * * *` on a CET box fires at 05:00 local, which is
-  04:00 UTC, and the program's 05:00-UTC check aborts it. This is a real bug
-  that silently skipped a day.
-- `0 6,7 * * *` covers 05:00 UTC in both halves of the year: 06:00 local in
-  winter (CET, UTC+1) and 07:00 local in summer (CEST, UTC+2). Whichever slot
-  lands in the 05:00 UTC hour runs; the other exits immediately with the
-  `Outside 05:00 UTC` log line. DST never shifts the slot.
-- On a cron that supports `CRON_TZ=UTC` (cronie, i.e. RHEL/Fedora), use that one
-  line instead of the two slots:
-
-      CRON_TZ=UTC
-      0 5 * * * $HOME/Paper-Scraper/run.sh
-
-- `TZ=UTC` stays so the job's log timestamps are UTC too.
-- Two lightweight starts per day, one real digest. `run.sh` captures
-  stdout/stderr, so cron has nothing to mail and no extra redirect is needed.
+- Cron schedules in **local** time. On Ubuntu/Debian, cron (vixie-cron) ignores
+  `TZ=UTC` when reading the schedule; the variable only reaches the job's
+  environment, where it keeps the log timestamps in UTC.
+- DeepSeek peak hours are 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday;
+  every other hour is off-peak, and weekends are off-peak all day. 06:30 local
+  is 05:30 UTC in winter (CET) and 04:30 UTC in summer (CEST), so either way it
+  sits in the 04:00-06:00 UTC weekday gap. A one-hour DST shift cannot move a
+  two-hour window, so the slot never drifts into peak.
+- On a winter weekday the run starts 05:30 UTC, leaving 30 minutes before peak
+  resumes; a normal run takes a few. Overrunning only makes the trailing calls
+  bill at peak rates.
+- There is no hour check in the program — cron owns the schedule, and there are
+  no timezone conversions to get wrong. The only guard is same-day idempotency,
+  so a second invocation logs `Already sent today` instead of posting twice.
+  `run.sh` captures stdout/stderr, so cron has nothing to mail and no extra
+  redirect is needed.
 - If the machine is off or the run fails, that day is skipped. The next run
   covers its own yesterday; nothing is replayed and nothing is queued.
 - Logs are truncated every 7 days, so disk use is the same after six months as
