@@ -186,9 +186,14 @@ def _ncbi_json(url, params, attempts=5):
                 logger.warning(f"NCBI {name} rejected the api_key; retrying without it")
                 continue
         else:
-            if not data.get("error"):
+            # A 200 can still carry a failure: PubMed's search backend reports
+            # outages as {"esearchresult": {"ERROR": "Search Backend failed..."}}
+            # rather than an HTTP error. Without this check that would read as a
+            # genuine "0 papers" result and silently produce an empty digest.
+            err = data.get("error") or data.get("esearchresult", {}).get("ERROR")
+            if not err:
                 return data
-            logger.warning(f"NCBI {name} error payload: {str(data['error'])[:200]}")
+            logger.warning(f"NCBI {name} error payload: {str(err)[:200]}")
         if attempt < attempts:
             time.sleep(wait)
     raise FetchError(f"NCBI {name} gave up after {attempts} attempts")
