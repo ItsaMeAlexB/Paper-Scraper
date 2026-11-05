@@ -35,7 +35,7 @@ Setup (Linux, one-time)
 1. Clone and install Python deps into a venv (distros that refuse a system
    `pip install` are the norm now):
 
-       git clone https://github.com/ItsaMeAlexB/Paper-Scraper.git ~/Paper-Scraper
+       git clone <your-repo-url> ~/Paper-Scraper
        cd ~/Paper-Scraper
        python3 -m venv .venv
        .venv/bin/pip install -r requirements.txt
