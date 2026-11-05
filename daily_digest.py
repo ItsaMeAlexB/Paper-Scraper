@@ -143,6 +143,10 @@ def build_query(term):
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
+class FetchError(RuntimeError):
+    """A source stayed unreachable after retries. Raised so a failed fetch is
+    never mistaken for a genuinely empty result (e.g. "no papers today")."""
+
 def _eutils_params(**extra):
     """Shared E-utilities params. An NCBI API key is optional, but when present
     it lifts the rate limit from 3/s to 10/s."""
@@ -152,13 +156,15 @@ def _eutils_params(**extra):
     params.update(extra)
     return params
 
-def _ncbi_json(url, params, attempts=3):
+def _ncbi_json(url, params, attempts=5):
     """GET an E-utilities JSON endpoint. NCBI intermittently answers with an
     error payload or a 429 instead of the expected key; one bad response must not
-    kill an unattended run, so back off, retry, then degrade to {}."""
+    kill an unattended run, so back off and retry. If every attempt fails we
+    raise FetchError — never return {} — so the caller can tell an outage apart
+    from a genuinely empty result."""
     name = url.rsplit("/", 1)[-1]
     for attempt in range(1, attempts + 1):
-        wait = 2 ** attempt                     # 2s, 4s, 8s
+        wait = min(2 ** attempt, 30)            # 2s, 4s, 8s, 16s, 30s (cap)
         try:
             resp = requests.get(url, params=params, timeout=60)
             resp.raise_for_status()
@@ -185,8 +191,7 @@ def _ncbi_json(url, params, attempts=3):
             logger.warning(f"NCBI {name} error payload: {str(data['error'])[:200]}")
         if attempt < attempts:
             time.sleep(wait)
-    logger.error(f"NCBI {name} gave up after {attempts} attempts")
-    return {}
+    raise FetchError(f"NCBI {name} gave up after {attempts} attempts")
 
 def fetch_all_pmids(query, start_date, end_date, max_results=10000):
     start_str = start_date.strftime("%Y/%m/%d")
@@ -497,10 +502,18 @@ def run_digest(now):
     # Topic search: every term, deduped globally so two terms cannot give the
     # same paper two numbers.
     papers, seen = [], set()
+    fetch_errors = 0
     for term in TERMS:
-        pmids = fetch_all_pmids(build_query(term), day, day)
+        try:
+            pmids = fetch_all_pmids(build_query(term), day, day)
+            fetched = fetch_metadata(pmids) if pmids else []
+        except FetchError as e:
+            logger.error(f"'{term}': fetch failed: {e}")
+            fetch_errors += 1
+            time.sleep(NCBI_DELAY)
+            continue
         fresh = 0
-        for p in (fetch_metadata(pmids) if pmids else []):
+        for p in fetched:
             key = _paper_key(p)
             if key in seen:
                 continue
@@ -509,14 +522,19 @@ def run_digest(now):
             fresh += 1
         logger.info(f"'{term}': {fresh} new paper(s)")
         time.sleep(NCBI_DELAY)
-    if not papers:
-        problems.append(f"PubMed: zero papers for the {day} window")
 
     # Named authors: mandatory, never triaged out.
     named_papers = []
     for query in AUTHOR_QUERIES:
-        pmids = fetch_all_pmids(query, day, day)
-        for p in (fetch_metadata(pmids) if pmids else []):
+        try:
+            pmids = fetch_all_pmids(query, day, day)
+            fetched = fetch_metadata(pmids) if pmids else []
+        except FetchError as e:
+            logger.error(f"{query}: fetch failed: {e}")
+            fetch_errors += 1
+            time.sleep(NCBI_DELAY)
+            continue
+        for p in fetched:
             key = _paper_key(p)
             if key in seen:
                 continue
@@ -525,7 +543,16 @@ def run_digest(now):
         time.sleep(NCBI_DELAY)
     logger.info(f"{len(named_papers)} named-author paper(s)")
 
+    total_queries = len(TERMS) + len(AUTHOR_QUERIES)
+    if fetch_errors == total_queries:
+        # Whole source unreachable. Fail loudly so the morning cron retries,
+        # instead of marking the day done with a bogus "no papers" digest.
+        raise FetchError(f"all {total_queries} PubMed fetch(es) failed")
+    if fetch_errors:
+        problems.append(f"PubMed: {fetch_errors}/{total_queries} fetch(es) failed")
     if not papers and not named_papers:
+        if not fetch_errors:
+            problems.append(f"PubMed: zero papers for the {day} window")
         return problems
 
     # Numbering spans both calls so [[REF:n]] stays valid across them.
@@ -562,10 +589,10 @@ def main():
         now = datetime.now(timezone.utc)
         logger.info(f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # Cron owns the schedule: one run a day at 06:30 machine-local time,
-        # which is 05:30 UTC in CET and 04:30 UTC in CEST — inside DeepSeek's
-        # 04:00-06:00 UTC weekday off-peak gap either way. No hour check here;
-        # the only guard is idempotency, so a second invocation cannot post twice.
+        # Cron owns the schedule: it fires hourly through the morning, and this
+        # run is a no-op once the day is marked sent. So a transient fetch
+        # failure at one slot is retried at the next, and the first success
+        # stops the rest. No hour check here; the only guard is idempotency.
         if days_since_last_sent() == 0:
             logger.info("Already sent today, skipping")
             return
@@ -578,6 +605,11 @@ def main():
         mark_sent_today()
         logger.info("Digest sent.")
 
+    except FetchError as e:
+        # Transient outage: leave last_sent_date untouched so the next scheduled
+        # run retries instead of skipping the day.
+        logger.error(f"Fetch failure (day not marked, will retry): {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
         logger.error(traceback.format_exc())

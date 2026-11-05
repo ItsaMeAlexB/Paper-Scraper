@@ -84,9 +84,9 @@ Setup (Linux, one-time)
 Scheduling
 ----------
 
-The digest is sent once a day at 06:30 machine-local time. One cron entry fires,
-`daily_digest.py` runs, and the machine goes back to doing nothing until the next
-day. No daemon, no resident process.
+The digest is sent once a day at 06:30 machine-local time. Cron fires hourly
+through the morning; the first run that succeeds marks the day done and the rest
+log `Already sent today` and exit. No daemon, no resident process.
 
 Add an entry to the system crontab:
 
@@ -95,16 +95,17 @@ Add an entry to the system crontab:
 Add these lines:
 
     TZ=UTC
-    30 6 * * * $HOME/Paper-Scraper/run.sh
+    30 6-9 * * * $HOME/Paper-Scraper/run.sh
 
 - Cron schedules in **local** time. On Ubuntu/Debian, cron (vixie-cron) ignores
   `TZ=UTC` when reading the schedule; the variable only reaches the job's
   environment, where it keeps the log timestamps in UTC.
 - DeepSeek peak hours are 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday;
-  every other hour is off-peak, and weekends are off-peak all day. 06:30 local
-  is 05:30 UTC in winter (CET) and 04:30 UTC in summer (CEST), so either way it
-  sits in the 04:00-06:00 UTC weekday gap. A one-hour DST shift cannot move a
-  two-hour window, so the slot never drifts into peak.
+  every other hour is off-peak, and weekends are off-peak all day. The 06:30
+  launch is 05:30 UTC in winter (CET) and 04:30 UTC in summer (CEST), so it sits
+  in the 04:00-06:00 UTC weekday gap. The later retry slots can land in peak
+  hours, but they only run when the earlier ones failed, so the cost is a rare
+  one.
 - On a winter weekday the run starts 05:30 UTC, leaving 30 minutes before peak
   resumes; a normal run takes a few. Overrunning only makes the trailing calls
   bill at peak rates.
@@ -113,7 +114,11 @@ Add these lines:
   so a second invocation logs `Already sent today` instead of posting twice.
   `run.sh` captures stdout/stderr, so cron has nothing to mail and no extra
   redirect is needed.
-- If the machine is off or the run fails, that day is skipped. The next run
+- A transient fetch failure (e.g. NCBI returns HTTP 500) exits non-zero and does
+  **not** mark the day done, so the next hourly slot retries it. A run that
+  genuinely finds zero papers still marks the day done, so it does not retry all
+  morning.
+- If the machine is off, or every slot fails, that day is skipped. The next run
   covers its own yesterday; nothing is replayed and nothing is queued.
 - Logs are truncated every 7 days, so disk use is the same after six months as
   after two days.
@@ -146,10 +151,11 @@ What a run does
 Missed-day behaviour
 --------------------
 
-- Sent today     -> skip.
-- Not sent today -> normal run over yesterday.
-- Missed a day   -> nothing happens; the next run covers its own yesterday and
-                    the missed day is simply not reported.
+- Sent today            -> skip.
+- Not sent today        -> normal run over yesterday.
+- Fetch failed          -> day stays unsent; the next hourly slot retries it.
+- Missed a day          -> nothing happens; the next run covers its own yesterday
+                           and the missed day is simply not reported.
 
 
 Rotating secrets
